@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: nz-diary-bot
     env: python
     buildCommand: pip install -r requirements.txt

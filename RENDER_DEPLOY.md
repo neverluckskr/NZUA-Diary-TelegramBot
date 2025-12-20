@@ -18,8 +18,10 @@
 
 ### Вариант 2: Ручная настройка
 
+**⚠️ ВАЖНО:** На Free плане Render Background Worker недоступен. Используйте **Web Service** вместо этого.
+
 1. Перейдите на [Render Dashboard](https://dashboard.render.com/)
-2. Нажмите **"New +"** → **"Background Worker"**
+2. Нажмите **"New +"** → **"Web Service"** (не Background Worker!)
 3. Подключите GitHub репозиторий:
    - Выберите репозиторий `neverluckskr/NZUA-Diary-TelegramBot`
    - Выберите ветку `main`
@@ -37,7 +39,9 @@
    TELEGRAM_BOT_TOKEN = ваш_токен_от_BotFather
    ```
 
-6. Нажмите **"Create Background Worker"**
+6. Нажмите **"Create Web Service"**
+
+**Примечание:** Хотя это Web Service, он будет работать как Background Worker для вашего бота, так как бот использует polling, а не веб-сервер.
 
 ## ⚙️ Важные настройки
 
