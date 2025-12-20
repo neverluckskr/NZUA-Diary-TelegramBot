@@ -11,9 +11,18 @@ import json
 import re
 import base64
 import hashlib
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import html
 import time
+
+# PostgreSQL support
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    psycopg2 = None
+    POSTGRES_AVAILABLE = False
 
 try:
     from cryptography.fernet import Fernet
@@ -26,10 +35,29 @@ API_BASE = "https://api-mobile.nz.ua"
 scraper = cloudscraper.create_scraper()
 
 # База даних
-DB_FILE = "nz_bot.db"
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL connection string
+DB_FILE = os.getenv("DB_FILE", "nz_bot.db")  # SQLite fallback
+USE_POSTGRES = bool(DATABASE_URL)
 ENCRYPTION_KEY_FILE = "bot_encryption.key"
-# Власник / основний адмін (заміни на свій ID)
-OWNER_ID = 1716175980
+# Власник / основний адмін (можна задати через змінну середовища OWNER_ID)
+OWNER_ID = int(os.getenv("OWNER_ID", "1716175980"))
+
+def get_db_connection():
+    """Повертає з'єднання з базою даних (PostgreSQL або SQLite)"""
+    if USE_POSTGRES and POSTGRES_AVAILABLE:
+        return psycopg2.connect(DATABASE_URL)
+    else:
+        return sqlite3.connect(DB_FILE)
+
+def db_execute(cursor, query, params=None):
+    """Виконує SQL запит з правильними параметрами для кожної БД"""
+    if USE_POSTGRES and params:
+        # Конвертуємо ? в %s для PostgreSQL
+        query = query.replace('?', '%s')
+    if params:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
 
 # Ініціалізація шифрування
 def get_encryption_key():
@@ -115,32 +143,64 @@ GRADES_LOOKBACK_DAYS = 30  # сколько дней смотреть на оц�
 
 def init_db():
     """Ініціалізація бази даних"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     
+    # Визначаємо синтаксис SQL залежно від БД
+    if USE_POSTGRES:
+        auto_inc = "SERIAL"
+        text_type = "TEXT"
+    else:
+        auto_inc = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        text_type = "TEXT"
+    
     # Таблиця сесій з шифрованими даними
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT NOT NULL,
-        password TEXT NOT NULL,
-        token TEXT NOT NULL,
-        student_id TEXT NOT NULL,
-        fio TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
+    if USE_POSTGRES:
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            token TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            fio TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+    else:
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            token TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            fio TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
     
     # Таблиця звернень до підтримки
-    c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        message TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'open',
-        resolved_by INTEGER,
-        resolved_at TIMESTAMP,
-        admin_note TEXT
-    )''')
+    if USE_POSTGRES:
+        c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'open',
+            resolved_by INTEGER,
+            resolved_at TIMESTAMP,
+            admin_note TEXT
+        )''')
+    else:
+        c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'open',
+            resolved_by INTEGER,
+            resolved_at TIMESTAMP,
+            admin_note TEXT
+        )''')
     
     # Таблиця VIP-підписок
     c.execute('''CREATE TABLE IF NOT EXISTS vip_users (
@@ -149,16 +209,25 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
-    # Таблиця відправлених нагадувань (щоб уникнути дублювання)
-    c.execute('''CREATE TABLE IF NOT EXISTS reminders_sent (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        lesson_date TEXT NOT NULL,
-        lesson_time TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
+    # Таблиця відправлених нагадувань
+    if USE_POSTGRES:
+        c.execute('''CREATE TABLE IF NOT EXISTS reminders_sent (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            lesson_date TEXT NOT NULL,
+            lesson_time TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+    else:
+        c.execute('''CREATE TABLE IF NOT EXISTS reminders_sent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            lesson_date TEXT NOT NULL,
+            lesson_time TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
 
-    # Таблиця останніх відомих оцінок (для нотифікацій про нові оцінки)
+    # Таблиця останніх відомих оцінок
     c.execute('''CREATE TABLE IF NOT EXISTS last_grades (
         user_id INTEGER NOT NULL,
         subject TEXT NOT NULL,
@@ -167,26 +236,45 @@ def init_db():
         PRIMARY KEY (user_id, subject)
     )''')
 
-    # Таблиця заявок на VIP з бота
-    c.execute('''CREATE TABLE IF NOT EXISTS vip_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        contact_text TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
+    # Таблиця заявок на VIP
+    if USE_POSTGRES:
+        c.execute('''CREATE TABLE IF NOT EXISTS vip_requests (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            contact_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+    else:
+        c.execute('''CREATE TABLE IF NOT EXISTS vip_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            contact_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
 
-    # Таблиця дій адміністраторів (лог)
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER NOT NULL,
-        action TEXT NOT NULL,
-        target_user INTEGER,
-        ticket_id INTEGER,
-        details TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
+    # Таблиця дій адміністраторів
+    if USE_POSTGRES:
+        c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
+            id SERIAL PRIMARY KEY,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            target_user INTEGER,
+            ticket_id INTEGER,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+    else:
+        c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            target_user INTEGER,
+            ticket_id INTEGER,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
 
-    # Налаштування VIP для користувачів (ключ-значення)
+    # Налаштування VIP для користувачів
     c.execute('''CREATE TABLE IF NOT EXISTS vip_settings (
         user_id INTEGER NOT NULL,
         key TEXT NOT NULL,
@@ -195,19 +283,38 @@ def init_db():
         PRIMARY KEY (user_id, key)
     )''')
     
-    # Таблиця останніх відомих новин (для нотифікацій)
-    c.execute('''CREATE TABLE IF NOT EXISTS last_news (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        news_id TEXT NOT NULL,
-        title TEXT,
-        content TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(news_id)
-    )''')
+    # Таблиця останніх відомих новин
+    if USE_POSTGRES:
+        c.execute('''CREATE TABLE IF NOT EXISTS last_news (
+            id SERIAL PRIMARY KEY,
+            news_id TEXT NOT NULL,
+            title TEXT,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(news_id)
+        )''')
+    else:
+        c.execute('''CREATE TABLE IF NOT EXISTS last_news (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            news_id TEXT NOT NULL,
+            title TEXT,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(news_id)
+        )''')
 
     # Міграція: додати колонки до таблиці support_tickets, якщо їх немає
-    c.execute("PRAGMA table_info(support_tickets)")
-    cols = [r[1] for r in c.fetchall()]
+    if USE_POSTGRES:
+        c.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name='support_tickets'
+        """)
+        cols = [r[0] for r in c.fetchall()]
+    else:
+        c.execute("PRAGMA table_info(support_tickets)")
+        cols = [r[1] for r in c.fetchall()]
+    
     if 'status' not in cols:
         c.execute("ALTER TABLE support_tickets ADD COLUMN status TEXT DEFAULT 'open'")
     if 'resolved_by' not in cols:
@@ -220,30 +327,44 @@ def init_db():
     conn.commit()
     conn.close()
     
+    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
     if CRYPTO_AVAILABLE:
-        print("✅ База даних ініціалізована (з шифруванням)")
+        print(f"✅ База даних ({db_type}) ініціалізована (з шифруванням)")
     else:
-        print("⚠️  База даних ініціалізована (без шифрування - встановіть cryptography)")
+        print(f"⚠️  База даних ({db_type}) ініціалізована (без шифрування - встановіть cryptography)")
 
 def save_session(user_id: int, username: str, password: str, token: str, student_id: str, fio: str):
     """Зберігає сесію користувача з шифрованими даними"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     
     # Шифруємо чутливі дані
     encrypted_password = encrypt_data(password)
     encrypted_token = encrypt_data(token)
     
-    c.execute('''INSERT OR REPLACE INTO sessions 
-                 (user_id, username, password, token, student_id, fio, last_login) 
-                 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
-              (user_id, username, encrypted_password, encrypted_token, student_id, fio))
+    if USE_POSTGRES:
+        c.execute('''INSERT INTO sessions 
+                     (user_id, username, password, token, student_id, fio, last_login) 
+                     VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                     ON CONFLICT (user_id) DO UPDATE SET
+                     username = EXCLUDED.username,
+                     password = EXCLUDED.password,
+                     token = EXCLUDED.token,
+                     student_id = EXCLUDED.student_id,
+                     fio = EXCLUDED.fio,
+                     last_login = CURRENT_TIMESTAMP''', 
+                  (user_id, username, encrypted_password, encrypted_token, student_id, fio))
+    else:
+        c.execute('''INSERT OR REPLACE INTO sessions 
+                     (user_id, username, password, token, student_id, fio, last_login) 
+                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
+                  (user_id, username, encrypted_password, encrypted_token, student_id, fio))
     conn.commit()
     conn.close()
 
 def get_session(user_id: int):
     """Отримує сесію користувача та дешифрує дані"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT username, password, token, student_id, fio FROM sessions WHERE user_id = ?', (user_id,))
     row = c.fetchone()
@@ -289,7 +410,7 @@ async def refresh_session(user_id: int):
 
 def delete_session_from_db(user_id: int):
     """Видаляє сесію користувача"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('DELETE FROM sessions WHERE user_id = ?', (user_id,))
     conn.commit()
@@ -297,7 +418,7 @@ def delete_session_from_db(user_id: int):
 
 def save_support_ticket(user_id: int, message: str):
     """Зберігає звернення до підтримки"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('INSERT INTO support_tickets (user_id, message) VALUES (?, ?)', (user_id, message))
     ticket_id = c.lastrowid
@@ -307,7 +428,7 @@ def save_support_ticket(user_id: int, message: str):
 
 def get_ticket(ticket_id: int):
     """Повертає дані тикету або None"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('''SELECT id, user_id, message, created_at, COALESCE(status,'open'), resolved_by, resolved_at, admin_note
                  FROM support_tickets WHERE id = ?''', (ticket_id,))
@@ -323,7 +444,7 @@ def get_ticket(ticket_id: int):
 
 def resolve_ticket_db(ticket_id: int, admin_id: int, note: str = None):
     """Позначає тикет як вирішений"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('UPDATE support_tickets SET status = ?, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP, admin_note = ? WHERE id = ?',
               ('closed', admin_id, note, ticket_id))
@@ -625,7 +746,7 @@ def parse_grades_from_html(html: str):
 
 def is_vip_user(user_id: int) -> bool:
     """Перевіряє чи є користувач VIP"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT expires_at FROM vip_users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
@@ -644,9 +765,10 @@ def is_vip_user(user_id: int) -> bool:
 def grant_vip(user_id: int, days: int = 30):
     """Надає VIP на вказану кількість днів"""
     expires_at = (datetime.now() + timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO vip_users (user_id, expires_at, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
+    if USE_POSTGRES:
+        c.execute('INSERT INTO vip_users (user_id, expires_at, created_at) VALUES (%s, %s, CURRENT_TIMESTAMP) ON CONFLICT (user_id) DO UPDATE SET expires_at = EXCLUDED.expires_at',
               (user_id, expires_at))
     conn.commit()
     conn.close()
@@ -654,7 +776,7 @@ def grant_vip(user_id: int, days: int = 30):
 
 def revoke_vip(user_id: int):
     """Відміняє VIP"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('DELETE FROM vip_users WHERE user_id = ?', (user_id,))
     conn.commit()
@@ -662,7 +784,7 @@ def revoke_vip(user_id: int):
 
 
 def save_reminder_sent(user_id: int, lesson_date: str, lesson_time: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('INSERT INTO reminders_sent (user_id, lesson_date, lesson_time) VALUES (?, ?, ?)',
               (user_id, lesson_date, lesson_time))
@@ -671,7 +793,7 @@ def save_reminder_sent(user_id: int, lesson_date: str, lesson_time: str):
 
 
 def has_reminder_sent(user_id: int, lesson_date: str, lesson_time: str) -> bool:
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT 1 FROM reminders_sent WHERE user_id = ? AND lesson_date = ? AND lesson_time = ?',
               (user_id, lesson_date, lesson_time))
@@ -681,7 +803,7 @@ def has_reminder_sent(user_id: int, lesson_date: str, lesson_time: str) -> bool:
 
 
 def get_last_grades(user_id: int) -> dict:
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT subject, last_grade FROM last_grades WHERE user_id = ?', (user_id,))
     rows = c.fetchall()
@@ -690,17 +812,21 @@ def get_last_grades(user_id: int) -> dict:
 
 
 def save_last_grades(user_id: int, grades: dict):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     for subject, grade in grades.items():
-        c.execute('INSERT OR REPLACE INTO last_grades (user_id, subject, last_grade, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
-                  (user_id, subject, grade))
+        if USE_POSTGRES:
+            c.execute('INSERT INTO last_grades (user_id, subject, last_grade, updated_at) VALUES (%s, %s, %s, CURRENT_TIMESTAMP) ON CONFLICT (user_id, subject) DO UPDATE SET last_grade = EXCLUDED.last_grade, updated_at = CURRENT_TIMESTAMP',
+                      (user_id, subject, grade))
+        else:
+            c.execute('INSERT OR REPLACE INTO last_grades (user_id, subject, last_grade, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
+                      (user_id, subject, grade))
     conn.commit()
     conn.close()
 
 
 def create_vip_request(user_id: int, message: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('INSERT INTO vip_requests (user_id, contact_text) VALUES (?, ?)', (user_id, message))
     ticket_id = c.lastrowid
@@ -711,7 +837,7 @@ def create_vip_request(user_id: int, message: str):
 
 def log_admin_action(admin_id: int, action: str, target_user: int = None, ticket_id: int = None, details: str = None):
     """Логує дію адміністратора в БД"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('INSERT INTO admin_actions (admin_id, action, target_user, ticket_id, details) VALUES (?, ?, ?, ?, ?)',
               (admin_id, action, target_user, ticket_id, details))
@@ -720,16 +846,20 @@ def log_admin_action(admin_id: int, action: str, target_user: int = None, ticket
 
 
 def set_vip_setting(user_id: int, key: str, value: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO vip_settings (user_id, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
-              (user_id, key, str(value)))
+    if USE_POSTGRES:
+        c.execute('INSERT INTO vip_settings (user_id, key, value, updated_at) VALUES (%s, %s, %s, CURRENT_TIMESTAMP) ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP',
+                  (user_id, key, str(value)))
+    else:
+        c.execute('INSERT OR REPLACE INTO vip_settings (user_id, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
+                  (user_id, key, str(value)))
     conn.commit()
     conn.close()
 
 
 def get_vip_setting(user_id: int, key: str, default=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT value FROM vip_settings WHERE user_id = ? AND key = ?', (user_id, key))
     row = c.fetchone()
@@ -740,7 +870,7 @@ def get_vip_setting(user_id: int, key: str, default=None):
 
 
 def get_all_vip_settings(user_id: int) -> dict:
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT key, value FROM vip_settings WHERE user_id = ?', (user_id,))
     rows = c.fetchall()
@@ -748,8 +878,13 @@ def get_all_vip_settings(user_id: int) -> dict:
     return {r[0]: r[1] for r in rows}
 
 
-# Жёстко заданные админы в коде (можно додати кілька ID) 
-ADMINS = [1716175980, 751886453]
+# Адміни (можна задати через змінну середовища ADMIN_IDS через кому, наприклад: "1716175980,751886453")
+ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "")
+if ADMIN_IDS_ENV:
+    ADMINS = [int(uid.strip()) for uid in ADMIN_IDS_ENV.split(",") if uid.strip()]
+else:
+    # За замовчуванням
+    ADMINS = [1716175980, 751886453]
 
 def is_admin(user_id: int) -> bool:
     """Перевіряє чи є користувач адміністратором.
@@ -767,7 +902,7 @@ def is_admin(user_id: int) -> bool:
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет расписание VIP-пользователей и отправляет напоминания за REMINDER_MINUTES"""
     print("[VIP JOB] Checking reminders")
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (datetime.now().isoformat(),))
     users = c.fetchall()
@@ -851,7 +986,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def check_grades(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет новые оценки для VIP-пользователей через новости и отправляет уведомления"""
     print("[VIP JOB] Checking grades from news")
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (datetime.now().isoformat(),))
     users = c.fetchall()
@@ -920,7 +1055,7 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 # Получаем последние известные новости из БД
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT news_id FROM last_news ORDER BY created_at DESC LIMIT 100')
                 known_news_ids = {row[0] for row in c.fetchall()}
@@ -933,7 +1068,7 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                     if news_id not in known_news_ids:
                         new_grades.append(item)
                         # Сохраняем в БД
-                        conn = sqlite3.connect(DB_FILE)
+                        conn = get_db_connection()
                         c = conn.cursor()
                         c.execute('INSERT OR IGNORE INTO last_news (news_id, title, content) VALUES (?, ?, ?)',
                                 (news_id, item.get('subject', ''), str(item)))
@@ -2381,7 +2516,7 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показує інформацію про VIP та інструкції по придбанню"""
     user_id = update.effective_user.id
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT expires_at FROM vip_users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
@@ -2425,7 +2560,7 @@ async def list_tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Невідомий фільтр. Використовуйте: open|closed|all")
             return
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     if state == 'open':
         c.execute("SELECT id, user_id, substr(message,1,80) as snippet, created_at FROM support_tickets WHERE COALESCE(status,'open') = 'open' ORDER BY created_at DESC LIMIT 200")
@@ -2460,7 +2595,7 @@ async def vip_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Получаем информацию о VIP статусе
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT expires_at FROM vip_users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
@@ -2502,7 +2637,7 @@ async def admin_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Получаем статистику
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     
     # Статистика пользователей
@@ -2549,7 +2684,7 @@ async def vip_actions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Тільки адміни можуть переглядати лог дій")
         return
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT id, admin_id, action, target_user, ticket_id, details, created_at FROM admin_actions ORDER BY created_at DESC LIMIT 50')
     rows = c.fetchall()
@@ -2842,7 +2977,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
         
         # Получаем информацию о VIP статусе для меню
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT expires_at FROM vip_users WHERE user_id = ?', (user_id,))
         row = c.fetchone()
@@ -3470,7 +3605,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         try:
             if action == 'stats':
                 # Детальная статистика
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 
                 # Общая статистика
@@ -3517,7 +3652,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             if action == 'vip_requests':
                 # Заявки на VIP
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT id, user_id, contact_text, created_at FROM vip_requests ORDER BY created_at DESC LIMIT 50')
                 rows = c.fetchall()
@@ -3554,7 +3689,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             if action == 'manage_vips':
                 # Улучшенное управление VIP
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT user_id, expires_at FROM vip_users ORDER BY expires_at DESC LIMIT 50')
                 rows = c.fetchall()
@@ -3580,7 +3715,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 return
             
             if action == 'list_vips':
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT user_id, expires_at FROM vip_users ORDER BY expires_at DESC')
                 rows = c.fetchall()
@@ -3621,7 +3756,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 return
 
             if action == 'view_actions':
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT id, admin_id, action, target_user, ticket_id, details, created_at FROM admin_actions ORDER BY created_at DESC LIMIT 50')
                 rows = c.fetchall()
@@ -3648,7 +3783,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 # parameter form: admin_menu:list_tickets[:state]
                 if len(parts) >= 3:
                     state = parts[2]
-                    conn = sqlite3.connect(DB_FILE)
+                    conn = get_db_connection()
                     c = conn.cursor()
                     if state == 'open':
                         c.execute("SELECT id, user_id, substr(message,1,80) as snippet, created_at FROM support_tickets WHERE COALESCE(status,'open') = 'open' ORDER BY created_at DESC LIMIT 200")
@@ -3684,7 +3819,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
             if action == 'back':
                 # Возвращаемся в главное меню с актуальной статистикой
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT COUNT(DISTINCT user_id) FROM sessions')
                 total_users = c.fetchone()[0] or 0
@@ -3795,7 +3930,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
             if action == 'view_vip_request' and len(parts) >= 3:
                 req_id = int(parts[2])
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT id, user_id, contact_text, created_at FROM vip_requests WHERE id = ?', (req_id,))
                 row = c.fetchone()
@@ -3825,7 +3960,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             if action == 'view_vip_user' and len(parts) >= 3:
                 target_uid = int(parts[2])
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT expires_at FROM vip_users WHERE user_id = ?', (target_uid,))
                 row = c.fetchone()
@@ -3872,7 +4007,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             if action == 'reject_vip_request' and len(parts) >= 3:
                 req_id = int(parts[2])
-                conn = sqlite3.connect(DB_FILE)
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('SELECT user_id FROM vip_requests WHERE id = ?', (req_id,))
                 row = c.fetchone()
