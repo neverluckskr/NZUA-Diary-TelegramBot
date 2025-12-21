@@ -3922,7 +3922,7 @@ def main():
     
     # Токен бота - задається через змінну середовища TELEGRAM_BOT_TOKEN або вбудований в код
     print("[STARTUP] main() reached: checking BOT_TOKEN...")
-    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7693623960:AAHjwDrkt6OhBImU-BmaJK2nZMjvk7a0U6Y")
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     # do not print token value raw; show masked info
     try:
         print(f"[STARTUP] BOT_TOKEN present: {bool(BOT_TOKEN)} length={len(BOT_TOKEN) if BOT_TOKEN else 0}")
