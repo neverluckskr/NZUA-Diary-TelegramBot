@@ -30,8 +30,13 @@ API_BASE = "https://api-mobile.nz.ua"
 scraper = cloudscraper.create_scraper()
 
 # База даних
-DB_FILE = os.getenv("DB_FILE", "data/nz_bot.db")
-ENCRYPTION_KEY_FILE = "bot_encryption.key"
+# На Railway volume монтується на /data, локально використовуємо data/
+if os.path.isdir("/data"):
+    DB_FILE = os.getenv("DB_FILE", "/data/nz_bot.db")
+    ENCRYPTION_KEY_FILE = "/data/bot_encryption.key"
+else:
+    DB_FILE = os.getenv("DB_FILE", "data/nz_bot.db")
+    ENCRYPTION_KEY_FILE = "data/bot_encryption.key"
 # Власник / основний адмін (можна задати через змінну середовища OWNER_ID)
 OWNER_ID = int(os.getenv("OWNER_ID", "1716175980"))
 
