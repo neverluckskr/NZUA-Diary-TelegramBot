@@ -99,17 +99,25 @@ POLICY_TEXT = """📋 *Політика конфіденційності та у
 • Рекомендуємо періодично перевіряти цю сторінку
 """
 
-VIP_TEXT = """⭐️ VIP-функції (в розробці)
+VIP_TEXT = """🎁 Free VIP — безкоштовно для одноклассників!
 
-Плановані можливості:
+• ✨ Можливості:
 • 🔔 Нагадування за 5 хв до уроку
 • 📬 Сповіщення про нові оцінки
-• 🎯 Детальна аналітика успішності
-• 🚀 Пріоритетні запити у підтримку
-• 📊 Експорт даних у форматі PDF
+• 🎯 Аналітика успішності
+• 📊 Експорт даних
 
-Слідкуйте за оновленнями!
+Free VIP видається тільки одноклассникам власника бота.
 """
+
+# Список одноклассников (им доступен Free VIP)
+CLASSMATES = [
+    1132700501, 5279618116, 1247759597, 2082626797, 1411185092, 7053455242,
+    1699237592, 5054267905, 5043377640, 5014023987, 6544254368, 7965156882,
+    6624745883, 1131614831, 5073499407, 5680245801, 1018036447, 1516218125,
+    6289987511, 1762490862, 2111925693, 6133869534, 2026640936, 1408724410,
+    1698107724, 5328485637, 1085938822, 5085998468, 588691770
+]
 
 # Конфіг для VIP-джобів
 REMINDER_MINUTES = 5  # сколько минут до урока отправлять напоминание
@@ -760,8 +768,8 @@ ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "")
 if ADMIN_IDS_ENV:
     ADMINS = [int(uid.strip()) for uid in ADMIN_IDS_ENV.split(",") if uid.strip()]
 else:
-    # За замовчуванням
-    ADMINS = [1716175980, 751886453]
+    # За замовчуванням: власник + його дівчина
+    ADMINS = [1716175980, 751886453, 1699237592]
 
 def is_admin(user_id: int) -> bool:
     """Перевіряє чи є користувач адміністратором.
@@ -849,7 +857,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             try:
                                 await context.bot.send_message(
                                     chat_id=user_id,
-                                    text=f"🔔 Нагадування: {subject_name} о {lesson_time} через {REMINDER_MINUTES} хвилин"
+                                    text=f"⏰ *{lesson_time}* — {subject_name}\n_через {REMINDER_MINUTES} хв_",
+                                    parse_mode=ParseMode.MARKDOWN
                                 )
                                 save_reminder_sent(user_id, lesson_date, lesson_time)
                                 print(f"[VIP JOB] Sent reminder to {user_id} for {lesson_date} {lesson_time}")
@@ -999,9 +1008,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             ['📅 Розклад'],
             ['📰 Новини', '📊 Середній бал'],
-            ['⭐️ VIP'],
+            ['🎁 Free VIP'],
             ['✉️ Підтримка']
         ]
+        # Для админов добавляем кнопку админ-меню
+        if is_admin(update.effective_user.id):
+            keyboard.append(['🛠 Админ-меню'])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(
             f"👋 З поверненням, {session['fio']}!\n\nОбирай функцію:",
@@ -1048,6 +1060,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('reply_ticket_id', None)
         return
 
+    # Admin broadcast message to all users
+    if step == 'admin_broadcast':
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text('❌ Тільки адміни можуть виконувати цю дію')
+            context.user_data.pop('step', None)
+            return
+        
+        broadcast_text = update.message.text
+        
+        # Получаем всех пользователей из базы данных
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT DISTINCT user_id FROM sessions')
+        user_rows = c.fetchall()
+        conn.close()
+        
+        total_users = len(user_rows)
+        success_count = 0
+        failed_count = 0
+        
+        # Отправляем сообщение всем пользователям
+        await update.message.reply_text(f"📤 Розсилка повідомлення {total_users} користувачам...")
+        
+        for row in user_rows:
+            user_id = row[0]
+            try:
+                await context.bot.send_message(user_id, broadcast_text)
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                print(f"[BROADCAST] Failed to send to user {user_id}: {e}")
+        
+        # Логируем действие админа
+        log_admin_action(update.effective_user.id, 'broadcast', details=f'sent to {success_count}/{total_users} users')
+        
+        # Отправляем отчет админу
+        result_text = (
+            f"✅ *Розсилка завершена*\n\n"
+            f"📊 Статистика:\n"
+            f"• Успішно: {success_count}\n"
+            f"• Не вдалось: {failed_count}\n"
+            f"• Всього: {total_users}"
+        )
+        await update.message.reply_text(result_text, parse_mode=ParseMode.MARKDOWN)
+        
+        context.user_data.pop('step', None)
+        return
+
     # Обробка логіну
     if step == 'waiting_login':
         context.user_data['login'] = update.message.text
@@ -1085,26 +1145,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data['FIO']
                 )
                 
+                # Автоматично видаємо Free VIP одноклассникам на 30 днів
+                vip_msg = ""
+                if update.effective_user.id in CLASSMATES and not is_vip_user(update.effective_user.id):
+                    grant_vip(update.effective_user.id, 30)
+                    vip_msg = "\n\n🎁 *Тобі активовано Free VIP на 30 днів!*"
+                
                 keyboard = [
                     ['📅 Розклад'],
                     ['📰 Новини', '📊 Середній бал'],
-                    ['⭐️ VIP'],
+                    ['🎁 Free VIP'],
                     ['✉️ Підтримка']
                 ]
+                if is_admin(update.effective_user.id):
+                    keyboard.append(['🛠 Админ-меню'])
                 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
                 
                 await update.message.reply_text(
                     f"✅ Вітаю, {data['FIO']}!\n\n"
                     f"🎓 ID учня: {data['student_id']}\n\n"
-                    f"Обирай функцію з меню нижче або використовуй команди:\n"
-                    f"/diary - Розклад\n"
-                    f"/homework - Домашнє завдання\n"
-                    f"/news - Новини\n"
-                    f"/avg - Середній бал\n"
-                    f"/vip - VIP-функції\n"
-                    f"/help - Допомога та команди\n\n"
-                    f"Використовуючи бот, ви погоджуєтеся з /policy",
-                    reply_markup=reply_markup
+                    f"Обирай функцію з меню нижче 👇{vip_msg}",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
                 )
             else:
                 await update.message.reply_text(
@@ -1264,10 +1326,45 @@ async def get_date_for_weekday(day_name: str) -> str:
     return target.strftime('%Y-%m-%d')
 
 async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE, date: str):
-    """Отримує розклад на конкретну дату"""
-    user_id = (query_or_update.from_user.id if hasattr(query_or_update, 'from_user') 
+    """Отримує розклад на конкретну дату (компактне форматування + домашка прив'язана до конкретного уроку)"""
+    user_id = (query_or_update.from_user.id if hasattr(query_or_update, 'from_user')
                else query_or_update.effective_user.id)
-    
+
+    def split_diary_tasks(tasks: list) -> tuple[str | None, list[str]]:
+        topic_parts: list[str] = []
+        homework_parts: list[str] = []
+
+        for raw in tasks or []:
+            # Разбиваем по переносам строк (данные могут прийти как одна строка с \n)
+            for line in str(raw).split('\n'):
+                s = line.strip()
+                if not s:
+                    continue
+
+                # Мусор: числа, одиночные буквы (Н, П, В и т.д.)
+                if re.fullmatch(r"\d+", s):
+                    continue
+                if re.fullmatch(r"[A-Za-zА-Яа-яЄєІіЇїҐґ]", s):
+                    continue
+
+                # Тема: только строки с "Поточна:" или "Тема:"
+                m_topic = re.match(r"^(поточна|тема)\s*[:\-]?\s*(.*)$", s, flags=re.IGNORECASE)
+                if m_topic:
+                    topic_parts.append((m_topic.group(2) or '').strip())
+                    continue
+
+                # Всё остальное — ДЗ. Убираем префикс "Д/з:" / "ДЗ:" если есть
+                hw_text = s
+                m_hw = re.match(r"^(д\s*/\s*з|дз)\s*[:\-]?\s*(.*)$", s, flags=re.IGNORECASE)
+                if m_hw:
+                    hw_text = (m_hw.group(2) or '').strip()
+
+                if hw_text:
+                    homework_parts.append(hw_text)
+
+        topic_text = "\n".join([p for p in topic_parts if p]) or None
+        return topic_text, [p for p in homework_parts if p]
+
     session = get_session(user_id)
     if not session:
         text = '❌ Спочатку увійдіть: /start'
@@ -1309,7 +1406,7 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
                     await query_or_update.message.reply_text(text)
                 return
 
-        # Получаем домашку
+        # Получаем домашку из diary
         r_hw = scraper.post(
             f"{API_BASE}/v1/schedule/diary",
             headers={"Authorization": f"Bearer {session['token']}"},
@@ -1323,174 +1420,93 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         if r_hw.status_code == 401:
             new_session = await refresh_session(user_id)
             if new_session:
+                session = new_session
                 r_hw = scraper.post(
                     f"{API_BASE}/v1/schedule/diary",
-                    headers={"Authorization": f"Bearer {new_session['token']}"},
+                    headers={"Authorization": f"Bearer {session['token']}"},
                     json={
-                        "student_id": new_session['student_id'],
+                        "student_id": session['student_id'],
                         "start_date": date,
                         "end_date": date
                     }
                 )
 
-        # Собираем домашку по предметам
+        # Собираем домашку по (предмет, номер урока) — чтобы не смешивать уроки одного предмета
         homework_dict = {}
         if r_hw.status_code == 200:
             hw_data = r_hw.json()
             for day in hw_data.get('dates', []):
                 for call in day.get('calls', []):
+                    call_num = call.get('call_number')
                     for subj in call.get('subjects', []):
                         name = subj.get('subject_name', 'Невідомо')
-                        tasks = subj.get('hometask', [])
-                        if tasks and tasks[0]:
-                            homework_dict[name] = tasks[0]
+                        tasks = subj.get('hometask', []) or []
+                        # Фильтруем мусор
+                        topic_text, hw_parts = split_diary_tasks(tasks)
+                        # Ключ = (предмет, номер урока)
+                        key = (name, call_num)
+                        if hw_parts:
+                            # Накапливаем, а не перезаписываем
+                            if key in homework_dict:
+                                homework_dict[key] += ', ' + ', '.join(hw_parts)
+                            else:
+                                homework_dict[key] = ', '.join(hw_parts)
 
         if r.status_code == 200:
             data = r.json()
-            
+
             # Форматування дати
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             day_name = WEEKDAYS[date_obj.weekday()]
-            
-            # Если суббота или воскресенье, показываем расписание на понедельник
-            if date_obj.weekday() >= 5:  # 5 = суббота, 6 = воскресенье
-                # Находим следующий понедельник
-                days_until_monday = (7 - date_obj.weekday()) % 7
-                if days_until_monday == 0:
-                    days_until_monday = 7
-                monday_date = date_obj + timedelta(days=days_until_monday)
-                monday_date_str = monday_date.strftime('%Y-%m-%d')
-                
-                # Получаем расписание на понедельник
-                r_monday = scraper.post(
-                    f"{API_BASE}/v1/schedule/timetable",
-                    headers={"Authorization": f"Bearer {session['token']}"},
-                    json={
-                        "student_id": session['student_id'],
-                        "start_date": monday_date_str,
-                        "end_date": monday_date_str
-                    }
-                )
-                
-                if r_monday.status_code == 401:
-                    new_session = await refresh_session(user_id)
-                    if new_session:
-                        session = new_session
-                        r_monday = scraper.post(
-                            f"{API_BASE}/v1/schedule/timetable",
-                            headers={"Authorization": f"Bearer {session['token']}"},
-                            json={
-                                "student_id": session['student_id'],
-                                "start_date": monday_date_str,
-                                "end_date": monday_date_str
-                            }
-                        )
-                
-                # Получаем домашку на понедельник
-                r_hw_monday = scraper.post(
-                    f"{API_BASE}/v1/schedule/diary",
-                    headers={"Authorization": f"Bearer {session['token']}"},
-                    json={
-                        "student_id": session['student_id'],
-                        "start_date": monday_date_str,
-                        "end_date": monday_date_str
-                    }
-                )
-                
-                if r_hw_monday.status_code == 401:
-                    new_session = await refresh_session(user_id)
-                    if new_session:
-                        session = new_session
-                        r_hw_monday = scraper.post(
-                            f"{API_BASE}/v1/schedule/diary",
-                            headers={"Authorization": f"Bearer {session['token']}"},
-                            json={
-                                "student_id": session['student_id'],
-                                "start_date": monday_date_str,
-                                "end_date": monday_date_str
-                            }
-                        )
-                
-                homework_dict_monday = {}
-                if r_hw_monday.status_code == 200:
-                    hw_data = r_hw_monday.json()
-                    for day in hw_data.get('dates', []):
-                        for call in day.get('calls', []):
-                            for subj in call.get('subjects', []):
-                                name = subj.get('subject_name', 'Невідомо')
-                                tasks = subj.get('hometask', [])
-                                if tasks and tasks[0]:
-                                    homework_dict_monday[name] = tasks[0]
-                
-                message = f"📅 *Розклад на понеділок*\n\n"
-                
-                if r_monday.status_code == 200:
-                    data_monday = r_monday.json()
-                    has_lessons = False
-                    for day in data_monday.get('dates', []):
-                        for call in day.get('calls', []):
-                            num = call.get('call_number')
-                            
-                            for subj in call.get('subjects', []):
-                                has_lessons = True
-                                name = subj.get('subject_name', 'Невідомо')
-                                
-                                message += f"*{num}.* {name}"
-                                # Добавляем домашку если есть
-                                if name in homework_dict_monday:
-                                    hw_text = homework_dict_monday[name]
-                                    message += f" - ДЗ: {hw_text}\n"
-                                else:
-                                    message += " - ДЗ: ?\n"
-                    
-                    if not has_lessons:
-                        message = "✅ На понеділок уроків немає!"
-                else:
-                    message = "❌ Не вдалось отримати розклад на понеділок"
-            else:
-                message = f"📅 *Розклад на {date_obj.strftime('%d.%m.%Y')}* ({day_name})\n\n"
-            
+
+            message = f"📅 *{date_obj.strftime('%d.%m')}* • {day_name}\n\n"
+
             has_lessons = False
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     num = call.get('call_number')
-                    time_start = call.get('time_start', '')
-                    time_end = call.get('time_end', '')
-                    
+                    time_start = call.get('time_start') or ''
+                    time_end = call.get('time_end') or ''
                     for subj in call.get('subjects', []):
                         has_lessons = True
                         name = subj.get('subject_name', 'Невідомо')
-                        room = subj.get('room', '')
-                        classroom = subj.get('classroom', {}).get('name', '') if subj.get('classroom') else ''
-                        if not room and classroom:
-                            room = classroom
-                        
-                        message += f"*{num}. {time_start}-{time_end}*\n\n"
-                        message += f"📖 {name}\n"
-                        if room:
-                            message += f"📍 Кабінет: {room}\n"
-                            # Добавляем домашку если есть
-                            if name in homework_dict:
-                                hw_text = homework_dict[name]
-                                message += f"ДЗ: {hw_text}\n"
-                            else:
-                                message += "ДЗ: ?\n"
-                        message += "\n"
-            
+                        room = subj.get('room', '') or (subj.get('classroom') or {}).get('name', '') or ''
+                        room_number = re.sub(r'[^\d]', '', str(room)) if room else ''
+
+                        # Компактный вывод в одну-две строки, всегда показываем 🚪
+                        room_str = f" 🚪{room_number}" if room_number else " 🚪—"
+                        message += f"`{num}.` *{time_start}* {name}{room_str}\n"
+
+                        # ДЗ — показываем всегда
+                        key = (name, num)
+                        if key in homework_dict:
+                            message += f"    📝 _{homework_dict[key]}_\n"
+                        else:
+                            message += "    📝 —\n"
+
             if not has_lessons:
-                message = f"✅ На {date_obj.strftime('%d.%m.%Y')} ({day_name}) уроків немає!"
-            
+                message = f"🌴 *{date_obj.strftime('%d.%m')}* • {day_name}\nУроків немає!"
+
+            # Inline-кнопки с днями недели (компактно в один ряд)
+            days_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Пн", callback_data="schedule:Понеділок"),
+                InlineKeyboardButton("Вт", callback_data="schedule:Вівторок"),
+                InlineKeyboardButton("Ср", callback_data="schedule:Середа"),
+                InlineKeyboardButton("Чт", callback_data="schedule:Четвер"),
+                InlineKeyboardButton("Пт", callback_data="schedule:П'ятниця")
+            ]])
+
             if hasattr(query_or_update, 'edit_message_text'):
-                await query_or_update.edit_message_text(message, parse_mode=ParseMode.MARKDOWN)
+                await query_or_update.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=days_kb)
             else:
-                await query_or_update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+                await query_or_update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=days_kb)
         else:
-            text = '❌ Не вдалось отримати розклад'
+            text = f"❌ Не вдалось отримати розклад (код: {r.status_code})"
             if hasattr(query_or_update, 'edit_message_text'):
                 await query_or_update.edit_message_text(text)
             else:
                 await query_or_update.message.reply_text(text)
-                
+
     except Exception as e:
         text = f"❌ Помилка: {e}"
         if hasattr(query_or_update, 'edit_message_text'):
@@ -1498,90 +1514,11 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         else:
             await query_or_update.message.reply_text(text)
 
-async def quick_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Быстрая команда: расписание и домашка на сегодня"""
-    today = datetime.now().strftime('%Y-%m-%d')
-    await update.message.reply_text("🔄 Завантажую дані на сьогодні...")
-    await schedule_for_date(update, context, today)
-    await homework_for_date(update, context, today)
-
-async def quick_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Быстрая команда: расписание и домашка на завтра"""
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    await update.message.reply_text("🔄 Завантажую дані на завтра...")
-    await schedule_for_date(update, context, tomorrow)
-    await homework_for_date(update, context, tomorrow)
-
-async def quick_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Быстрая команда: расписание на неделю"""
-    today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
-    friday = monday + timedelta(days=4)
-    
-    await update.message.reply_text("🔄 Завантажую розклад на тиждень...")
-    
-    session = get_session(update.effective_user.id)
-    if not session:
-        await update.message.reply_text('❌ Спочатку увійдіть: /start')
-        return
-    
-    try:
-        r = scraper.post(
-            f"{API_BASE}/v1/schedule/timetable",
-            headers={"Authorization": f"Bearer {session['token']}"},
-            json={
-                "student_id": session['student_id'],
-                "start_date": monday.strftime('%Y-%m-%d'),
-                "end_date": friday.strftime('%Y-%m-%d')
-            }
-        )
-        
-        if r.status_code == 401:
-            new_session = await refresh_session(update.effective_user.id)
-            if new_session:
-                r = scraper.post(
-                    f"{API_BASE}/v1/schedule/timetable",
-                    headers={"Authorization": f"Bearer {new_session['token']}"},
-                    json={
-                        "student_id": new_session['student_id'],
-                        "start_date": monday.strftime('%Y-%m-%d'),
-                        "end_date": friday.strftime('%Y-%m-%d')
-                    }
-                )
-        
-        if r.status_code == 200:
-            data = r.json()
-            message = f"📅 *Розклад на тиждень* ({monday.strftime('%d.%m')} - {friday.strftime('%d.%m.%Y')})\n\n"
-            
-            for day in data.get('dates', []):
-                date_str = day.get('date', '')
-                if date_str:
-                    try:
-                        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                        day_name = WEEKDAYS[date_obj.weekday()]
-                        message += f"*{day_name}, {date_obj.strftime('%d.%m')}*\n"
-                        
-                        for call in day.get('calls', []):
-                            time_start = call.get('time_start', '')
-                            subjects = call.get('subjects', [])
-                            if subjects:
-                                subject_name = subjects[0].get('subject_name', 'Урок')
-                                message += f"  {time_start} - {subject_name}\n"
-                        message += "\n"
-                    except Exception:
-                        pass
-            
-            await update.message.reply_text(message)
-        else:
-            await update.message.reply_text('❌ Не вдалось отримати розклад')
-    except Exception as e:
-        await update.message.reply_text(f"❌ Помилка: {e}")
-
 async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE, date: str):
     """Отримує домашнє завдання на конкретну дату"""
-    user_id = (query_or_update.from_user.id if hasattr(query_or_update, 'from_user') 
+    user_id = (query_or_update.from_user.id if hasattr(query_or_update, 'from_user')
                else query_or_update.effective_user.id)
-    
+
     session = get_session(user_id)
     if not session:
         text = '❌ Спочатку увійдіть: /start'
@@ -1595,25 +1532,16 @@ async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         r = scraper.post(
             f"{API_BASE}/v1/schedule/diary",
             headers={"Authorization": f"Bearer {session['token']}"},
-            json={
-                "student_id": session['student_id'],
-                "start_date": date,
-                "end_date": date
-            }
+            json={"student_id": session['student_id'], "start_date": date, "end_date": date}
         )
 
-        # Якщо токен застарів, оновлюємо
         if r.status_code == 401:
             new_session = await refresh_session(user_id)
             if new_session:
                 r = scraper.post(
                     f"{API_BASE}/v1/schedule/diary",
                     headers={"Authorization": f"Bearer {new_session['token']}"},
-                    json={
-                        "student_id": new_session['student_id'],
-                        "start_date": date,
-                        "end_date": date
-                    }
+                    json={"student_id": new_session['student_id'], "start_date": date, "end_date": date}
                 )
             else:
                 text = '❌ Сесія застаріла. Використайте /logout та /start'
@@ -1625,38 +1553,41 @@ async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
 
         if r.status_code == 200:
             data = r.json()
-            
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             day_name = WEEKDAYS[date_obj.weekday()]
-            
             message = f"📚 *Домашнє завдання на {date_obj.strftime('%d.%m.%Y')}* ({day_name})\n\n"
-            
+
             has_homework = False
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
+                    num = call.get('call_number')
+                    time_start = call.get('time_start') or ''
+                    time_end = call.get('time_end') or ''
                     for subj in call.get('subjects', []):
                         name = subj.get('subject_name', 'Невідомо')
-                        tasks = subj.get('hometask', [])
-                        
-                        if tasks and tasks[0]:
+                        tasks = subj.get('hometask', []) or []
+                        tasks_filtered = [str(t).strip() for t in tasks if t and str(t).strip()]
+                        if tasks_filtered:
                             has_homework = True
-                            message += f"📖 *{name}*\n"
-                            message += f"{tasks[0]}\n\n"
-            
+                            message += f"*{num}. {time_start}-{time_end}*\n"
+                            message += f"📖 {name}\n"
+                            hw_text = "\n".join(tasks_filtered)
+                            message += f"ДЗ: {hw_text}\n\n"
+
             if not has_homework:
                 message = f"✅ На {date_obj.strftime('%d.%m.%Y')} ({day_name}) домашки немає!"
-            
+
             if hasattr(query_or_update, 'edit_message_text'):
-                await query_or_update.edit_message_text(message)
+                await query_or_update.edit_message_text(message, parse_mode=ParseMode.MARKDOWN)
             else:
-                await query_or_update.message.reply_text(message)
+                await query_or_update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
         else:
             text = '❌ Не вдалось отримати домашку'
             if hasattr(query_or_update, 'edit_message_text'):
                 await query_or_update.edit_message_text(text)
             else:
                 await query_or_update.message.reply_text(text)
-                
+
     except Exception as e:
         text = f"❌ Помилка: {e}"
         if hasattr(query_or_update, 'edit_message_text'):
@@ -2292,9 +2223,6 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Якщо блоку немає — спробуємо парсити текстовий варіант (функція parse_news_from_html)
         if not root:
             print("[NEWS] Container 'school-news-list' not found, falling back to regex parser")
-            with open('news_debug.html', 'w', encoding='utf-8') as f:
-                f.write(news_resp.text[:10000])
-
             parsed = parse_news_from_html(news_resp.text)
             if parsed:
                 await update.message.reply_text(format_news_message(parsed))
@@ -2391,25 +2319,8 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============== ІНШІ КОМАНДИ ==============
 
 async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показує інформацію про VIP та інструкції по придбанню"""
-    user_id = update.effective_user.id
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT expires_at FROM vip_users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    conn.close()
-
-    if row and row[0]:
-        expires = row[0]
-        await update.message.reply_text(
-            f"✨ Ви VIP-користувач!\n\nТермін дії до: {expires}\n\n" + VIP_TEXT
-        )
-    else:
-        await update.message.reply_text(
-            VIP_TEXT +
-            "\n\n💡 Щоб стати VIP — напишіть адміну: https://t.me/impulsedevfd\n" +
-            "Або надішліть заявку через бота: /vip_request"
-        )
+    """Показує VIP-меню (тот же функционал, что и кнопка VIP)"""
+    await vip_menu_cmd(update, context)
 
 async def vip_request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ініціює заявку на VIP: просить користувача надіслати повідомлення"""
@@ -2501,8 +2412,8 @@ async def vip_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         return kb
 
-    text = f"✨ *VIP-меню*\n\n"
-    text += f"📅 Термін дії до: {expires_text}\n\n"
+    text = f"🎁 *Free VIP*\n\n"
+    text += f"📅 Діє до: `{expires_text}`\n\n"
     text += "Оберіть опцію:"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_keyboard(user_id))
 
@@ -2542,7 +2453,8 @@ async def admin_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Заявки на VIP", callback_data="admin_menu:vip_requests")],
         [InlineKeyboardButton("▶️ Запустити: Нагадування", callback_data="admin_menu:run_reminders"), InlineKeyboardButton("▶️ Запустити: Оцінки", callback_data="admin_menu:run_grades")],
         [InlineKeyboardButton("🗂️ Лог дій", callback_data="admin_menu:view_actions")],
-        [InlineKeyboardButton("⚙️ Управління", callback_data="admin_menu:management")]
+        [InlineKeyboardButton("⚙️ Управління", callback_data="admin_menu:management")],
+        [InlineKeyboardButton("📢 Написати оповіщення всім юзерам", callback_data="admin_menu:broadcast")]
     ])
 
     stats_text = f"🛠️ *Адмінське меню*\n\n"
@@ -2601,13 +2513,9 @@ async def policy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /support - підтримка"""
     await update.message.reply_text(
-        "✉️ *ПІДТРИМКА*\n\n"
-        "Напишіть ваше звернення у наступному повідомленні, і ми його зафіксуємо.\n\n"
-        "Ви можете повідомити про:\n"
-        "• Помилки в роботі бота\n"
-        "• Пропозиції щодо нових функцій\n"
-        "• Питання про VIP-підписку\n"
-        "• Інші питання"
+        "✉️ *Підтримка*\n\n"
+        "Напишіть повідомлення — ми отримаємо його.",
+        parse_mode=ParseMode.MARKDOWN
     )
     context.user_data['step'] = 'support'
 
@@ -2713,30 +2621,15 @@ async def ticket_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help - допомога"""
     await update.message.reply_text(
-        "ℹ️ *ДОПОМОГА*\n\n"
-        "📱 *Основні функції:*\n"
-        "• *📅 Розклад* - переглянути розклад уроків на будь-який день\n"
-        "• *📰 Новини* - останні новини та оцінки від вчителів\n"
-        "• *📊 Середній бал* - розрахунок середнього балу за період\n"
-        "• *⭐️ VIP* - додаткові функції для VIP-користувачів\n"
-        "• *✉️ Підтримка* - зв'язок з адміністрацією\n\n"
-        "⌨️ *Команди:*\n"
-        "/start - Авторизація / початок роботи\n"
-        "/diary - Розклад уроків\n"
-        "/homework - Домашнє завдання\n"
-        "/news - Останні новини\n"
-        "/avg - Середній бал (або вкажіть дати)\n"
-        "/vip - VIP-меню та функції\n"
-        "/support - Зв'язок з підтримкою\n"
-        "/policy - Політика конфіденційності\n"
-        "/logout - Вийти з системи\n"
-        "/help - Ця довідка\n\n"
-        "💡 *Поради:*\n"
-        "• Для середнього балу натисніть кнопку '📊 Середній бал' або надішліть дати:\n"
-        "  10.12.2025 20.12.2025\n"
-        "• Використовуйте кнопки меню для швидкого доступу\n"
-        "• У розкладі для вихідних днів показується розклад на понеділок\n\n"
-        "❓ *Питання?* Напишіть /support",
+        "📖 *Довідка*\n\n"
+        "*Кнопки меню:*\n"
+        "`📅` Розклад • `📰` Новини\n"
+        "`📊` Середній бал • `🎁` Free VIP\n\n"
+        "*Команди:*\n"
+        "`/diary` `/news` `/avg` `/vip`\n"
+        "`/support` `/logout` `/help`\n\n"
+        "_Середній бал:_ надішліть дати\n"
+        "`10.12.2025 20.12.2025`",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -2751,7 +2644,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if text == "📅 Розклад":
-        await show_weekday_keyboard(update, context, kind='schedule')
+        # Сразу показываем расписание на сегодня с кнопками дней
+        today = datetime.now()
+        weekday = today.weekday()
+        
+        if weekday >= 5:  # Субота або Неділя
+            await update.message.reply_text(
+                f"🌴 *{WEEKDAYS[weekday]}* — вихідний",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Пн", callback_data="schedule:Понеділок"),
+                        InlineKeyboardButton("Вт", callback_data="schedule:Вівторок"),
+                        InlineKeyboardButton("Ср", callback_data="schedule:Середа"),
+                        InlineKeyboardButton("Чт", callback_data="schedule:Четвер"),
+                        InlineKeyboardButton("Пт", callback_data="schedule:П'ятниця")
+                    ]
+                ])
+            )
+        else:
+            await schedule_for_date(update, context, today.strftime('%Y-%m-%d'))
     elif text == "📚 Домашка":
         # Убрали отдельную кнопку, теперь только через Розклад
         await show_weekday_keyboard(update, context, kind='schedule')
@@ -2774,10 +2686,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif text == "📰 Новини":
         await news_cmd(update, context)
-    elif text == "⭐️ VIP":
+    elif text == "🎁 Free VIP" or text == "⭐️ VIP":
         await vip_menu_cmd(update, context)
     elif text == "✉️ Підтримка":
         await support_cmd(update, context)
+    elif text == "🛠 Админ-меню":
+        if is_admin(update.effective_user.id):
+            await admin_menu_cmd(update, context)
+        else:
+            await update.message.reply_text("❌ Тільки для адміністраторів")
     else:
         await update.message.reply_text("❓ Не знаю такої кнопки. Використайте /help для довідки.")
 
@@ -3694,6 +3611,24 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     await query.edit_message_text('📭 Оберіть які звернення показувати:', reply_markup=kb)
                     return
 
+            if action == 'broadcast':
+                # Запрашиваем текст для рассылки
+                await query.answer()
+                await query.edit_message_text(
+                    "📢 *Розсилка повідомлення всім користувачам*\n\n"
+                    "Надішліть текст повідомлення, яке буде надіслано всім зареєстрованим користувачам.\n\n"
+                    "⚠️ Будьте обережні з розсилкою!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                # Устанавливаем step через context.user_data (привязан к пользователю автоматически)
+                context.user_data['step'] = 'admin_broadcast'
+                # Отправляем сообщение админу для ввода текста
+                await context.bot.send_message(
+                    query.from_user.id,
+                    "✍️ Введіть текст повідомлення для розсилки всім користувачам:"
+                )
+                return
+            
             if action == 'back':
                 # Возвращаемся в главное меню с актуальной статистикой
                 conn = get_db_connection()
@@ -3723,7 +3658,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     [InlineKeyboardButton("📋 Заявки на VIP", callback_data="admin_menu:vip_requests")],
                     [InlineKeyboardButton("▶️ Запустити: Нагадування", callback_data="admin_menu:run_reminders"), InlineKeyboardButton("▶️ Запустити: Оцінки", callback_data="admin_menu:run_grades")],
                     [InlineKeyboardButton("🗂️ Лог дій", callback_data="admin_menu:view_actions")],
-                    [InlineKeyboardButton("⚙️ Управління", callback_data="admin_menu:management")]
+                    [InlineKeyboardButton("⚙️ Управління", callback_data="admin_menu:management")],
+                    [InlineKeyboardButton("📢 Написати оповіщення всім юзерам", callback_data="admin_menu:broadcast")]
                 ])
                 await query.edit_message_text(stats_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
                 return
@@ -3986,7 +3922,7 @@ def main():
     
     # Токен бота - задається через змінну середовища TELEGRAM_BOT_TOKEN або вбудований в код
     print("[STARTUP] main() reached: checking BOT_TOKEN...")
-    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8324737437:AAFhXagyrNmX4aCtVha032GhR63Rl36TAi8")
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7693623960:AAHjwDrkt6OhBImU-BmaJK2nZMjvk7a0U6Y")
     # do not print token value raw; show masked info
     try:
         print(f"[STARTUP] BOT_TOKEN present: {bool(BOT_TOKEN)} length={len(BOT_TOKEN) if BOT_TOKEN else 0}")
@@ -4041,7 +3977,7 @@ def main():
 
     # Кнопки з клавіатури
     app.add_handler(MessageHandler(
-        filters.Regex("^(📅 Розклад|📚 Домашка|📰 Новини|📊 Середній бал|📅 На сьогодні|📅 На завтра|📅 На тиждень|⭐️ VIP|✉️ Підтримка)$"),
+        filters.Regex("^(📅 Розклад|📚 Домашка|📰 Новини|📊 Середній бал|📅 На сьогодні|📅 На завтра|📅 На тиждень|⭐️ VIP|🎁 Free VIP|✉️ Підтримка|🛠 Админ-меню)$"),
         button_handler
     ))
 
