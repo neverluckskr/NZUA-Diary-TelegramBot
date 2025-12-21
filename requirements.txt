@@ -3,5 +3,4 @@ cloudscraper==1.2.71
 beautifulsoup4==4.14.3
 cryptography>=46.0.0
 requests>=2.32.0
-psycopg2-binary>=2.9.0
 

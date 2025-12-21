@@ -14,15 +14,8 @@ import hashlib
 from urllib.parse import urljoin, urlparse
 import html
 import time
-
-# PostgreSQL support
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    POSTGRES_AVAILABLE = True
-except ImportError:
-    psycopg2 = None
-    POSTGRES_AVAILABLE = False
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 try:
     from cryptography.fernet import Fernet
@@ -35,29 +28,14 @@ API_BASE = "https://api-mobile.nz.ua"
 scraper = cloudscraper.create_scraper()
 
 # База даних
-DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL connection string
-DB_FILE = os.getenv("DB_FILE", "nz_bot.db")  # SQLite fallback
-USE_POSTGRES = bool(DATABASE_URL)
+DB_FILE = os.getenv("DB_FILE", "nz_bot.db")
 ENCRYPTION_KEY_FILE = "bot_encryption.key"
 # Власник / основний адмін (можна задати через змінну середовища OWNER_ID)
 OWNER_ID = int(os.getenv("OWNER_ID", "1716175980"))
 
 def get_db_connection():
-    """Повертає з'єднання з базою даних (PostgreSQL або SQLite)"""
-    if USE_POSTGRES and POSTGRES_AVAILABLE:
-        return psycopg2.connect(DATABASE_URL)
-    else:
-        return sqlite3.connect(DB_FILE)
-
-def db_execute(cursor, query, params=None):
-    """Виконує SQL запит з правильними параметрами для кожної БД"""
-    if USE_POSTGRES and params:
-        # Конвертуємо ? в %s для PostgreSQL
-        query = query.replace('?', '%s')
-    if params:
-        cursor.execute(query, params)
-    else:
-        cursor.execute(query)
+    """Повертає з'єднання з базою даних SQLite"""
+    return sqlite3.connect(DB_FILE)
 
 # Ініціалізація шифрування
 def get_encryption_key():
@@ -146,61 +124,29 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Визначаємо синтаксис SQL залежно від БД
-    if USE_POSTGRES:
-        auto_inc = "SERIAL"
-        text_type = "TEXT"
-    else:
-        auto_inc = "INTEGER PRIMARY KEY AUTOINCREMENT"
-        text_type = "TEXT"
-    
     # Таблиця сесій з шифрованими даними
-    if USE_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL,
-            password TEXT NOT NULL,
-            token TEXT NOT NULL,
-            student_id TEXT NOT NULL,
-            fio TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL,
-            password TEXT NOT NULL,
-            token TEXT NOT NULL,
-            student_id TEXT NOT NULL,
-            fio TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT NOT NULL,
+        password TEXT NOT NULL,
+        token TEXT NOT NULL,
+        student_id TEXT NOT NULL,
+        fio TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
     
     # Таблиця звернень до підтримки
-    if USE_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'open',
-            resolved_by INTEGER,
-            resolved_at TIMESTAMP,
-            admin_note TEXT
-        )''')
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'open',
-            resolved_by INTEGER,
-            resolved_at TIMESTAMP,
-            admin_note TEXT
-        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'open',
+        resolved_by INTEGER,
+        resolved_at TIMESTAMP,
+        admin_note TEXT
+    )''')
     
     # Таблиця VIP-підписок
     c.execute('''CREATE TABLE IF NOT EXISTS vip_users (
@@ -210,22 +156,13 @@ def init_db():
     )''')
 
     # Таблиця відправлених нагадувань
-    if USE_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS reminders_sent (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            lesson_date TEXT NOT NULL,
-            lesson_time TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS reminders_sent (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            lesson_date TEXT NOT NULL,
-            lesson_time TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS reminders_sent (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        lesson_date TEXT NOT NULL,
+        lesson_time TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
 
     # Таблиця останніх відомих оцінок
     c.execute('''CREATE TABLE IF NOT EXISTS last_grades (
@@ -237,42 +174,23 @@ def init_db():
     )''')
 
     # Таблиця заявок на VIP
-    if USE_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS vip_requests (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            contact_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS vip_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            contact_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS vip_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        contact_text TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
 
     # Таблиця дій адміністраторів
-    if USE_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
-            id SERIAL PRIMARY KEY,
-            admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            target_user INTEGER,
-            ticket_id INTEGER,
-            details TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            target_user INTEGER,
-            ticket_id INTEGER,
-            details TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        target_user INTEGER,
+        ticket_id INTEGER,
+        details TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
 
     # Налаштування VIP для користувачів
     c.execute('''CREATE TABLE IF NOT EXISTS vip_settings (
@@ -284,36 +202,18 @@ def init_db():
     )''')
     
     # Таблиця останніх відомих новин
-    if USE_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS last_news (
-            id SERIAL PRIMARY KEY,
-            news_id TEXT NOT NULL,
-            title TEXT,
-            content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(news_id)
-        )''')
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS last_news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            news_id TEXT NOT NULL,
-            title TEXT,
-            content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(news_id)
-        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS last_news (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        news_id TEXT NOT NULL,
+        title TEXT,
+        content TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(news_id)
+    )''')
 
     # Міграція: додати колонки до таблиці support_tickets, якщо їх немає
-    if USE_POSTGRES:
-        c.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name='support_tickets'
-        """)
-        cols = [r[0] for r in c.fetchall()]
-    else:
-        c.execute("PRAGMA table_info(support_tickets)")
-        cols = [r[1] for r in c.fetchall()]
+    c.execute("PRAGMA table_info(support_tickets)")
+    cols = [r[1] for r in c.fetchall()]
     
     if 'status' not in cols:
         c.execute("ALTER TABLE support_tickets ADD COLUMN status TEXT DEFAULT 'open'")
@@ -327,11 +227,10 @@ def init_db():
     conn.commit()
     conn.close()
     
-    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
     if CRYPTO_AVAILABLE:
-        print(f"✅ База даних ({db_type}) ініціалізована (з шифруванням)")
+        print(f"✅ База даних (SQLite) ініціалізована (з шифруванням)")
     else:
-        print(f"⚠️  База даних ({db_type}) ініціалізована (без шифрування - встановіть cryptography)")
+        print(f"⚠️  База даних (SQLite) ініціалізована (без шифрування - встановіть cryptography)")
 
 def save_session(user_id: int, username: str, password: str, token: str, student_id: str, fio: str):
     """Зберігає сесію користувача з шифрованими даними"""
@@ -342,23 +241,10 @@ def save_session(user_id: int, username: str, password: str, token: str, student
     encrypted_password = encrypt_data(password)
     encrypted_token = encrypt_data(token)
     
-    if USE_POSTGRES:
-        c.execute('''INSERT INTO sessions 
-                     (user_id, username, password, token, student_id, fio, last_login) 
-                     VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                     ON CONFLICT (user_id) DO UPDATE SET
-                     username = EXCLUDED.username,
-                     password = EXCLUDED.password,
-                     token = EXCLUDED.token,
-                     student_id = EXCLUDED.student_id,
-                     fio = EXCLUDED.fio,
-                     last_login = CURRENT_TIMESTAMP''', 
-                  (user_id, username, encrypted_password, encrypted_token, student_id, fio))
-    else:
-        c.execute('''INSERT OR REPLACE INTO sessions 
-                     (user_id, username, password, token, student_id, fio, last_login) 
-                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
-                  (user_id, username, encrypted_password, encrypted_token, student_id, fio))
+    c.execute('''INSERT OR REPLACE INTO sessions 
+                 (user_id, username, password, token, student_id, fio, last_login) 
+                 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
+              (user_id, username, encrypted_password, encrypted_token, student_id, fio))
     conn.commit()
     conn.close()
 
@@ -767,8 +653,7 @@ def grant_vip(user_id: int, days: int = 30):
     expires_at = (datetime.now() + timedelta(days=days)).isoformat()
     conn = get_db_connection()
     c = conn.cursor()
-    if USE_POSTGRES:
-        c.execute('INSERT INTO vip_users (user_id, expires_at, created_at) VALUES (%s, %s, CURRENT_TIMESTAMP) ON CONFLICT (user_id) DO UPDATE SET expires_at = EXCLUDED.expires_at',
+    c.execute('INSERT OR REPLACE INTO vip_users (user_id, expires_at, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
               (user_id, expires_at))
     conn.commit()
     conn.close()
@@ -815,12 +700,8 @@ def save_last_grades(user_id: int, grades: dict):
     conn = get_db_connection()
     c = conn.cursor()
     for subject, grade in grades.items():
-        if USE_POSTGRES:
-            c.execute('INSERT INTO last_grades (user_id, subject, last_grade, updated_at) VALUES (%s, %s, %s, CURRENT_TIMESTAMP) ON CONFLICT (user_id, subject) DO UPDATE SET last_grade = EXCLUDED.last_grade, updated_at = CURRENT_TIMESTAMP',
-                      (user_id, subject, grade))
-        else:
-            c.execute('INSERT OR REPLACE INTO last_grades (user_id, subject, last_grade, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
-                      (user_id, subject, grade))
+        c.execute('INSERT OR REPLACE INTO last_grades (user_id, subject, last_grade, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
+                  (user_id, subject, grade))
     conn.commit()
     conn.close()
 
@@ -848,12 +729,8 @@ def log_admin_action(admin_id: int, action: str, target_user: int = None, ticket
 def set_vip_setting(user_id: int, key: str, value: str):
     conn = get_db_connection()
     c = conn.cursor()
-    if USE_POSTGRES:
-        c.execute('INSERT INTO vip_settings (user_id, key, value, updated_at) VALUES (%s, %s, %s, CURRENT_TIMESTAMP) ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP',
-                  (user_id, key, str(value)))
-    else:
-        c.execute('INSERT OR REPLACE INTO vip_settings (user_id, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
-                  (user_id, key, str(value)))
+    c.execute('INSERT OR REPLACE INTO vip_settings (user_id, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
+              (user_id, key, str(value)))
     conn.commit()
     conn.close()
 
@@ -4079,14 +3956,37 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 # ============== ЗАПУСК ==============
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Простий HTTP handler для health check"""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    
+    def log_message(self, format, *args):
+        # Отключаем логирование HTTP запросов
+        pass
+
+def run_bot(app):
+    """Запускає бота в окремому потоці"""
+    try:
+        print("[STARTUP] Starting polling...")
+        app.run_polling()
+    except Exception as exc:
+        import traceback
+        tb = ''.join(traceback.format_exception(None, exc, exc.__traceback__))
+        print(f"[STARTUP ERROR] app.run_polling failed: {exc}\n{tb}")
+        raise
+
 def main():
     """Головна функція запуску бота"""
     # Ініціалізація БД
     init_db()
     
-    # Токен бота - задається через змінну середовища TELEGRAM_BOT_TOKEN
+    # Токен бота - задається через змінну середовища TELEGRAM_BOT_TOKEN або вбудований в код
     print("[STARTUP] main() reached: checking BOT_TOKEN...")
-    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8324737437:AAFhXagyrNmX4aCtVha032GhR63Rl36TAi8")
     # do not print token value raw; show masked info
     try:
         print(f"[STARTUP] BOT_TOKEN present: {bool(BOT_TOKEN)} length={len(BOT_TOKEN) if BOT_TOKEN else 0}")
