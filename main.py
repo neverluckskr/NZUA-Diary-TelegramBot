@@ -17,6 +17,7 @@ import html
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from report_card_parser import parse_report_card
 
 try:
     from cryptography.fernet import Fernet
@@ -29,7 +30,7 @@ API_BASE = "https://api-mobile.nz.ua"
 scraper = cloudscraper.create_scraper()
 
 # База даних
-DB_FILE = os.getenv("DB_FILE", "nz_bot.db")
+DB_FILE = os.getenv("DB_FILE", "data/nz_bot.db")
 ENCRYPTION_KEY_FILE = "bot_encryption.key"
 # Власник / основний адмін (можна задати через змінну середовища OWNER_ID)
 OWNER_ID = int(os.getenv("OWNER_ID", "1716175980"))
@@ -409,9 +410,7 @@ def _extract_numeric_from_mark(mark):
 
 def parse_grades_from_html(html: str):
     """Парсить сторінку 'Виписка оцінок' і повертати (start_date, end_date, {subject: [(token, date_iso_or_None), ...]})"""
-    # Initialize visible range
-    start_date = None
-    end_date = None
+    from bs4 import BeautifulSoup
 
     try:
         from bs4 import BeautifulSoup
@@ -789,18 +788,25 @@ def is_admin(user_id: int) -> bool:
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет расписание VIP-пользователей и отправляет напоминания за REMINDER_MINUTES"""
-    print("[VIP JOB] Checking reminders")
+    print("[VIP JOB] Checking reminders...")
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (datetime.now().isoformat(),))
     users = c.fetchall()
     conn.close()
+    
+    if not users:
+        print("[VIP JOB] No active VIP users found")
+        return
+
+    print(f"[VIP JOB] Found {len(users)} active VIP users")
 
     for user in users:
         try:
             user_id = user[0]
             session = get_session(user_id)
             if not session:
+                print(f"[VIP JOB] No session for user {user_id}")
                 continue
 
             # Проверяем настройки напоминаний
@@ -810,66 +816,100 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             today = datetime.now().strftime('%Y-%m-%d')
-            r = scraper.post(
-                f"{API_BASE}/v1/schedule/timetable",
-                headers={"Authorization": f"Bearer {session['token']}"},
-                json={"student_id": session['student_id'], "start_date": today, "end_date": today}
-            )
+            
+            # Пробуем получить расписание через API
+            try:
+                r = scraper.post(
+                    f"{API_BASE}/v1/schedule/timetable",
+                    headers={"Authorization": f"Bearer {session['token']}"},
+                    json={"student_id": session['student_id'], "start_date": today, "end_date": today},
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"[VIP JOB] API request failed for user {user_id}: {e}")
+                continue
 
             if r.status_code == 401:
+                print(f"[VIP JOB] Token expired for user {user_id}, refreshing...")
                 new_s = await refresh_session(user_id)
                 if new_s:
                     session = new_s
-                    r = scraper.post(
-                        f"{API_BASE}/v1/schedule/timetable",
-                        headers={"Authorization": f"Bearer {session['token']}"},
-                        json={"student_id": session['student_id'], "start_date": today, "end_date": today}
-                    )
+                    try:
+                        r = scraper.post(
+                            f"{API_BASE}/v1/schedule/timetable",
+                            headers={"Authorization": f"Bearer {session['token']}"},
+                            json={"student_id": session['student_id'], "start_date": today, "end_date": today},
+                            timeout=10
+                        )
+                    except Exception as e:
+                        print(f"[VIP JOB] API request failed after refresh for user {user_id}: {e}")
+                        continue
                 else:
+                    print(f"[VIP JOB] Could not refresh session for user {user_id}")
                     continue
 
             if r.status_code != 200:
+                print(f"[VIP JOB] API returned {r.status_code} for user {user_id}")
                 continue
 
-            data = r.json()
+            try:
+                data = r.json()
+            except Exception as e:
+                print(f"[VIP JOB] Could not parse JSON for user {user_id}: {e}")
+                continue
+            
             now_dt = datetime.now()
+            lessons_today = []
 
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     time_start = call.get('time_start')
                     if not time_start:
                         continue
+                    
+                    subject_name = "Урок"
+                    subjects = call.get('subjects', [])
+                    if subjects:
+                        subject_name = subjects[0].get('subject_name', subject_name)
+                    
+                    lessons_today.append({'time': time_start, 'subject': subject_name})
+                    
                     try:
                         lesson_dt = datetime.strptime(f"{today} {time_start}", "%Y-%m-%d %H:%M")
                     except Exception:
                         continue
 
                     delta = (lesson_dt - now_dt).total_seconds()
-                    # если урок через REMINDER_MINUTES минут (с запасом +-30 сек)
-                    if 0 < delta <= REMINDER_MINUTES * 60 + 30:
-                        # проверяем, не отправляли ли уже напоминание
-                        subject_name = "Урок"
-                        subjects = call.get('subjects', [])
-                        if subjects:
-                            subject_name = subjects[0].get('subject_name', subject_name)
-
+                    
+                    # Расширяем окно: напоминание за REMINDER_MINUTES минут (с запасом)
+                    # Отправляем если урок через 1-6 минут
+                    min_delta = 60  # минимум 1 минута до урока
+                    max_delta = (REMINDER_MINUTES + 1) * 60  # максимум REMINDER_MINUTES+1 минут
+                    
+                    if min_delta < delta <= max_delta:
                         lesson_date = today
                         lesson_time = time_start
 
                         if not has_reminder_sent(user_id, lesson_date, lesson_time):
+                            minutes_left = int(delta // 60)
                             try:
                                 await context.bot.send_message(
                                     chat_id=user_id,
-                                    text=f"⏰ *{lesson_time}* — {subject_name}\n_через {REMINDER_MINUTES} хв_",
+                                    text=f"⏰ *{lesson_time}* — {subject_name}\n_через {minutes_left} хв_",
                                     parse_mode=ParseMode.MARKDOWN
                                 )
                                 save_reminder_sent(user_id, lesson_date, lesson_time)
-                                print(f"[VIP JOB] Sent reminder to {user_id} for {lesson_date} {lesson_time}")
+                                print(f"[VIP JOB] ✅ Sent reminder to {user_id} for {lesson_time} {subject_name} (in {minutes_left} min)")
                             except Exception as e:
-                                print(f"[VIP JOB] Could not send reminder to {user_id}: {e}")
+                                print(f"[VIP JOB] ❌ Could not send reminder to {user_id}: {e}")
+            
+            if lessons_today:
+                print(f"[VIP JOB] User {user_id} has {len(lessons_today)} lessons today: {[l['time'] for l in lessons_today]}")
 
         except Exception as e:
             print(f"[VIP JOB] Error processing user {user}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 async def check_grades(context: ContextTypes.DEFAULT_TYPE):
@@ -936,38 +976,85 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                 if not news_resp:
+                    print(f"[VIP JOB] Could not fetch news for user {user_id}")
                     continue
 
-                # Парсим новости
-                parsed = parse_news_from_html(news_resp.text)
-                if not parsed:
+                # Парсим через BeautifulSoup (как в news_cmd)
+                soup = BeautifulSoup(news_resp.text, "html.parser")
+                root = soup.find("div", id="school-news-list")
+                
+                if not root:
+                    print(f"[VIP JOB] No school-news-list found for user {user_id}")
+                    continue
+                
+                items = root.select("div.news-page__item")
+                if not items:
+                    print(f"[VIP JOB] No news items found for user {user_id}")
                     continue
 
                 # Получаем последние известные новости из БД
                 conn = get_db_connection()
                 c = conn.cursor()
-                c.execute('SELECT news_id FROM last_news ORDER BY created_at DESC LIMIT 100')
+                c.execute('SELECT news_id FROM last_news WHERE news_id LIKE ? ORDER BY created_at DESC LIMIT 200', (f"{user_id}_%",))
                 known_news_ids = {row[0] for row in c.fetchall()}
                 conn.close()
 
-                # Формируем ID для каждой новости (учитель + дата + оценка + предмет)
                 new_grades = []
-                for item in parsed:
-                    news_id = f"{item.get('teacher', '')}_{item.get('date', '')}_{item.get('grade', '')}_{item.get('subject', '')}"
+                
+                for item in items[:20]:
+                    name_el = item.select_one(".news-page__header .news-page__name")
+                    date_el = item.select_one(".news-page__header .news-page__date")
+                    desc_el = item.select_one(".news-page__desc")
+                    
+                    teacher = name_el.get_text(strip=True) if name_el else ""
+                    date_str = date_el.get_text(strip=True) if date_el else ""
+                    
+                    if not desc_el:
+                        continue
+                    
+                    desc_text = desc_el.get_text(" ", strip=True)
+                    
+                    # Ищем паттерн оценки
+                    grade_pattern = r'Ви отримали оцінку\s+([\wА-ЯІЇЄҐа-яіїєґ/]+)\s+з предмету:\s+([^,]+),\s+(.+)'
+                    changed_pattern = r'Оцінка змінена на\s+([\wА-ЯІЇЄҐа-яіїєґ/]+)\s+з предмету:\s+([^,]+),\s+(.+)'
+                    
+                    match = re.search(grade_pattern, desc_text)
+                    is_changed = False
+                    if not match:
+                        match = re.search(changed_pattern, desc_text)
+                        is_changed = True
+                    
+                    if not match:
+                        continue
+                    
+                    grade = match.group(1).strip()
+                    subject = match.group(2).strip()
+                    grade_type = match.group(3).strip()
+                    
+                    # Формируем уникальный ID для новости (включаем user_id)
+                    news_id = f"{user_id}_{teacher}_{date_str}_{grade}_{subject}"
+                    
                     if news_id not in known_news_ids:
-                        new_grades.append(item)
+                        new_grades.append({
+                            'teacher': teacher,
+                            'date': date_str,
+                            'grade': grade,
+                            'subject': subject,
+                            'type': grade_type,
+                            'is_changed': is_changed
+                        })
                         # Сохраняем в БД
                         conn = get_db_connection()
                         c = conn.cursor()
                         c.execute('INSERT OR IGNORE INTO last_news (news_id, title, content) VALUES (?, ?, ?)',
-                                (news_id, item.get('subject', ''), str(item)))
+                                (news_id, subject, str({'grade': grade, 'teacher': teacher})))
                         conn.commit()
                         conn.close()
 
                 if new_grades:
                     # Форматируем уведомления
-                    text_lines = ["📬 Нові оцінки:"]
-                    for item in new_grades[:10]:  # Максимум 10 уведомлений
+                    text_lines = ["📬 *Нові оцінки:*"]
+                    for item in new_grades[:10]:
                         teacher_name = item.get('teacher', '')
                         if teacher_name:
                             name_parts = teacher_name.split()
@@ -984,18 +1071,27 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                         grade = item.get('grade', '')
                         subject = item.get('subject', '')
                         grade_type = item.get('type', '')
+                        is_changed = item.get('is_changed', False)
                         
                         formatted_type = format_grade_type(grade_type)
-                        text_lines.append(f"• {short_name} - {date_str}, поставила Вам оцінку \"{grade}\" з \"{subject}\", {formatted_type}")
+                        
+                        if is_changed:
+                            text_lines.append(f"• {short_name} - {date_str}, змінила оцінку на *{grade}* з _{subject}_, {formatted_type}")
+                        else:
+                            text_lines.append(f"• {short_name} - {date_str}, поставила *{grade}* з _{subject}_, {formatted_type}")
 
                     try:
-                        await context.bot.send_message(chat_id=user_id, text="\n".join(text_lines))
-                        print(f"[VIP JOB] Sent grade notifications from news to {user_id}")
+                        await context.bot.send_message(chat_id=user_id, text="\n".join(text_lines), parse_mode=ParseMode.MARKDOWN)
+                        print(f"[VIP JOB] Sent {len(new_grades)} grade notifications to {user_id}")
                     except Exception as e:
                         print(f"[VIP JOB] Could not send grades to {user_id}: {e}")
+                else:
+                    print(f"[VIP JOB] No new grades for user {user_id}")
 
             except Exception as e:
                 print(f"[VIP JOB] Error checking news for user {user_id}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
         except Exception as e:
@@ -1009,25 +1105,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(update.effective_user.id)
     if session:
         keyboard = [
-            ['📅 Розклад'],
+            ['📅 Розклад', '📋 Табель'],
             ['📰 Новини', '📊 Середній бал'],
-            ['🎁 Free VIP'],
-            ['✉️ Підтримка']
+            ['🎁 Free VIP', '✉️ Підтримка']
         ]
         # Для админов добавляем кнопку админ-меню
         if is_admin(update.effective_user.id):
             keyboard.append(['🛠 Админ-меню'])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        welcome_back = (
+            f"👋 *З поверненням, {session['fio']}!*\n\n"
+            "🎓 Ваш електронний щоденник готовий до роботи\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📱 *Оберіть функцію з меню нижче:*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📅 Розклад • 📋 Табель • 📰 Новини\n"
+            "📊 Середній бал • 🎁 VIP • ✉️ Підтримка\n\n"
+            "_Потрібна допомога? Натисніть_ /help"
+        )
         await update.message.reply_text(
-            f"👋 З поверненням, {session['fio']}!\n\nОбирай функцію:",
-            reply_markup=reply_markup
+            welcome_back,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
         )
         return
     
-    await update.message.reply_text(
-        "👋 Привіт! Я бот для роботи з NZ.UA\n\n"
-        "📱 Введи свій логін для входу:"
+    welcome_text = (
+        "👋 *Вітаємо в NZ.UA Bot!*\n\n"
+        "🎓 Це неофіційний бот для зручної роботи з електронним щоденником NZ.UA\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✨ *Можливості бота:*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📅 Розклад уроків на будь-який день\n"
+        "📋 Табель успішності з оцінками\n"
+        "📰 Новини та оцінки від вчителів\n"
+        "📊 Розрахунок середнього балу\n"
+        "🔔 Сповіщення про нові оцінки (VIP)\n"
+        "⏰ Нагадування про уроки (VIP)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔒 *Безпека:*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "• Ваші дані зберігаються в зашифрованому вигляді\n"
+        "• Бот не передає дані третім особам\n"
+        "• Ви можете видалити дані командою /logout\n"
+        "• Детальніше: /policy\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📱 *Для входу введіть свій логін NZ.UA:*"
     )
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
     context.user_data['step'] = 'waiting_login'
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1155,10 +1280,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     vip_msg = "\n\n🎁 *Тобі активовано Free VIP на 30 днів!*"
                 
                 keyboard = [
-                    ['📅 Розклад'],
+                    ['📅 Розклад', '📋 Табель'],
                     ['📰 Новини', '📊 Середній бал'],
-                    ['🎁 Free VIP'],
-                    ['✉️ Підтримка']
+                    ['🎁 Free VIP', '✉️ Підтримка']
                 ]
                 if is_admin(update.effective_user.id):
                     keyboard.append(['🛠 Админ-меню'])
@@ -2502,6 +2626,83 @@ async def vip_actions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🗂️ Останні дії адміністраторів:\n\n" + "\n".join(lines)
     await update.message.reply_text(text)
 
+
+async def report_card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для отримання табеля успішності"""
+    user_id = update.effective_user.id
+    session = get_session(user_id)
+    
+    if not session:
+        await update.message.reply_text("❌ Спочатку увійдіть: /start")
+        return
+    
+    msg = await update.message.reply_text("🔄 Завантажую табель...")
+    
+    try:
+        from bs4 import BeautifulSoup
+        
+        login_url = "https://nz.ua/login"
+        headers = {'User-Agent': 'nz-bot/1.0'}
+        
+        login_page = scraper.get(login_url, headers=headers)
+        login_soup = BeautifulSoup(login_page.text, "html.parser")
+        
+        csrf = None
+        meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
+        if meta_csrf:
+            csrf = meta_csrf.get('content')
+        hidden_csrf = login_soup.find('input', {'name': '_csrf'})
+        if hidden_csrf and hidden_csrf.get('value'):
+            csrf = hidden_csrf.get('value')
+        
+        login_data = {
+            "LoginForm[login]": session['username'],
+            "LoginForm[password]": session['password'],
+            "LoginForm[rememberMe]": "1"
+        }
+        if csrf:
+            login_data['_csrf'] = csrf
+            headers['X-CSRF-Token'] = csrf
+        
+        scraper.post(login_url, data=login_data, headers=headers)
+        
+        report_url = "https://nz.ua/schedule/report-card"
+        report_resp = scraper.get(report_url, headers=headers)
+        
+        if report_resp.status_code != 200 or 'Табель' not in report_resp.text:
+            await msg.edit_text("❌ Не вдалося завантажити табель. Спробуйте пізніше.")
+            return
+        
+        results = parse_report_card(report_resp.text)
+        
+        if not results:
+            await msg.edit_text("📋 Табель порожній або не знайдено предметів.")
+            return
+        
+        lines = ["📋 *Табель успішності*\n"]
+        lines.append("```")
+        
+        for item in results:
+            subject = item['subject']
+            grade = item['semester_1']
+            if len(subject) > 30:
+                subject = subject[:27] + "..."
+            lines.append(f"{subject}: {grade}")
+        
+        lines.append("```")
+        
+        with_grades = [r for r in results if r['semester_1'] != 'немає']
+        if with_grades:
+            avg_grade = sum(int(r['semester_1']) for r in with_grades) / len(with_grades)
+            lines.append(f"\n📊 Середній бал: *{avg_grade:.2f}*")
+        
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        print(f"[REPORT_CARD] Error: {e}")
+        await msg.edit_text(f"❌ Помилка: {e}")
+
+
 async def diary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /diary - розклад"""
     await show_weekday_keyboard(update, context, kind='schedule')
@@ -2623,18 +2824,42 @@ async def ticket_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help - допомога"""
-    await update.message.reply_text(
-        "📖 *Довідка*\n\n"
-        "*Кнопки меню:*\n"
-        "`📅` Розклад • `📰` Новини\n"
-        "`📊` Середній бал • `🎁` Free VIP\n\n"
-        "*Команди:*\n"
-        "`/diary` `/news` `/avg` `/vip`\n"
-        "`/support` `/logout` `/help`\n\n"
-        "_Середній бал:_ надішліть дати\n"
-        "`10.12.2025 20.12.2025`",
-        parse_mode=ParseMode.MARKDOWN
+    help_text = (
+        "📖 *Довідка NZ.UA Bot*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📱 *КНОПКИ МЕНЮ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📅 *Розклад* — переглянути розклад уроків на сьогодні, завтра або будь-який день тижня. Показує предмети, час, кабінети та домашні завдання.\n\n"
+        "📋 *Табель* — табель успішності з оцінками за 1 семестр. Показує всі предмети та середній бал.\n\n"
+        "📰 *Новини* — останні новини зі шкільного щоденника: оцінки, зауваження, оголошення від вчителів.\n\n"
+        "📊 *Середній бал* — розрахунок середнього балу за вказаний період або за весь навчальний рік.\n\n"
+        "🎁 *Free VIP* — безкоштовні VIP-функції: нагадування про уроки, сповіщення про нові оцінки, аналітика успішності.\n\n"
+        "✉️ *Підтримка* — зв\'язок з розробником бота для питань та пропозицій.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⌨️ *КОМАНДИ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "`/start` — головне меню\n"
+        "`/help` — ця довідка\n"
+        "`/diary` — розклад уроків\n"
+        "`/news` — новини\n"
+        "`/avg` — середній бал\n"
+        "`/vip` — VIP-меню\n"
+        "`/support` — підтримка\n"
+        "`/logout` — вийти з акаунту\n"
+        "`/policy` — політика конфіденційності\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 *ПІДКАЗКИ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "• Для розрахунку середнього балу за період надішліть дати у форматі:\n"
+        "  `10.12.2025 20.12.2025`\n\n"
+        "• Бот автоматично оновлює дані з NZ.UA при кожному запиті\n\n"
+        "• VIP-користувачі отримують сповіщення про нові оцінки та нагадування про уроки\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔒 *БЕЗПЕКА*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Ваші дані зберігаються в зашифрованому вигляді та використовуються виключно для роботи з NZ.UA. Детальніше: /policy"
     )
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 # ============== ОБРОБКА КНОПОК ==============
 
@@ -2687,6 +2912,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb
         )
+    elif text == "📋 Табель":
+        await report_card_cmd(update, context)
     elif text == "📰 Новини":
         await news_cmd(update, context)
     elif text == "🎁 Free VIP" or text == "⭐️ VIP":
@@ -3980,7 +4207,7 @@ def main():
 
     # Кнопки з клавіатури
     app.add_handler(MessageHandler(
-        filters.Regex("^(📅 Розклад|📚 Домашка|📰 Новини|📊 Середній бал|📅 На сьогодні|📅 На завтра|📅 На тиждень|⭐️ VIP|🎁 Free VIP|✉️ Підтримка|🛠 Админ-меню)$"),
+        filters.Regex("^(📅 Розклад|📋 Табель|📚 Домашка|📰 Новини|📊 Середній бал|📅 На сьогодні|📅 На завтра|📅 На тиждень|⭐️ VIP|🎁 Free VIP|✉️ Підтримка|🛠 Админ-меню)$"),
         button_handler
     ))
 
