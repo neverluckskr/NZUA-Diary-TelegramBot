@@ -4070,7 +4070,9 @@ def main():
     # Start polling with error capture
     try:
         print("[STARTUP] Starting polling...")
-        app.run_polling()
+        # drop_pending_updates=True очищает очередь обновлений при старте
+        # Это помогает избежать конфликтов при перезапуске
+        app.run_polling(drop_pending_updates=True)
     except Exception as exc:
         import traceback
         tb = ''.join(traceback.format_exception(None, exc, exc.__traceback__))
