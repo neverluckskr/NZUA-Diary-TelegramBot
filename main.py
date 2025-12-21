@@ -1,6 +1,7 @@
 import cloudscraper
 import sqlite3
 import os
+import requests
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -124,6 +125,8 @@ REMINDER_MINUTES = 5  # сколько минут до урока отправл
 REMINDER_INTERVAL = 60  # проверять каждые N секунд
 GRADE_POLL_INTERVAL = 300  # проверять оценки каждые N секунд
 GRADES_LOOKBACK_DAYS = 30  # сколько дней смотреть на оценки
+PING_URL = os.getenv("PING_URL")
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", "600"))  # каждые N секунд слать пинг, по умолчанию 10 минут
 
 # ============== БАЗА ДАНИХ ==============
 
@@ -3988,6 +3991,8 @@ def main():
     try:
         app.job_queue.run_repeating(check_reminders, interval=REMINDER_INTERVAL, first=10)
         app.job_queue.run_repeating(check_grades, interval=GRADE_POLL_INTERVAL, first=20)
+        if PING_URL:
+            app.job_queue.run_repeating(ping_self, interval=PING_INTERVAL, first=15)
         print("[VIP JOB] Background jobs registered: reminders every", REMINDER_INTERVAL, "s; grades every", GRADE_POLL_INTERVAL, "s")
     except Exception as e:
         print("[VIP JOB] Could not register jobs:", e)
@@ -4042,6 +4047,18 @@ async def _handle_message_debug(update: Update, context: ContextTypes.DEFAULT_TY
 
 # replace registration with debug wrapper
 # (registration moved into main() to ensure proper initialization)
+
+
+# ----------- KEEPALIVE PING ------------
+async def ping_self(context: ContextTypes.DEFAULT_TYPE):
+    """Периодически шлёт HTTP-запрос на заданный PING_URL, чтобы не дать хостингу заснуть"""
+    if not PING_URL:
+        return
+    try:
+        r = requests.get(PING_URL, timeout=5)
+        print(f"[PING] {PING_URL} status={r.status_code}")
+    except Exception as e:
+        print(f"[PING] failed: {e}")
 
 if __name__ == "__main__":
     main()
