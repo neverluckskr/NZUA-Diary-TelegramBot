@@ -3453,6 +3453,72 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 if not subjects_parsed:
                     grades_url = f"https://nz.ua/schedule/grades-statement"
                     params = {'student_id': session['student_id']}
+                    headers = {'User-Agent': 'nz-bot/1.0 (+https://nz.ua)', 'Referer': grades_url}
+                    grades_html = None
+                    
+                    # Створюємо один scraper для всієї сесії веб-логіну
+                    web_scraper = get_scraper()
+                    # Пробуем несколько раз с логином (как в avg)
+                    for attempt in range(4):
+                        try:
+                            gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                            if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
+                                grades_html = gresp.text
+                                break
+                        except Exception as exc:
+                            pass
+                        
+                        # Try logging in and retry
+                        try:
+                            login_url = "https://nz.ua/login"
+                            page = web_scraper.get(login_url, timeout=10, headers=headers)
+                            csrf = None
+                            from bs4 import BeautifulSoup
+                            login_soup = BeautifulSoup(page.text, 'html.parser')
+                            meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
+                            if meta_csrf:
+                                csrf = meta_csrf.get('content')
+                            hidden_csrf = login_soup.find('input', {'name': '_csrf'})
+                            if hidden_csrf and hidden_csrf.get('value'):
+                                csrf = hidden_csrf.get('value')
+                            
+                            login_data = {
+                                "LoginForm[login]": session['username'],
+                                "LoginForm[password]": session['password'],
+                                "LoginForm[rememberMe]": "1"
+                            }
+                            lheaders = {'Referer': grades_url}
+                            if csrf:
+                                login_data['_csrf'] = csrf
+                                lheaders['X-CSRF-Token'] = csrf
+                            
+                            web_scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
+                            # retry fetch after login
+                            try:
+                                gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                                if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
+                                    grades_html = gresp.text
+                                    break
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        
+                        time.sleep(1)
+                    
+                    if grades_html:
+                        sd, ed, subs = parse_grades_from_html(grades_html)
+                        for name, toks in subs.items():
+                            filtered = []
+                            for tok_item in toks:
+                                if isinstance(tok_item, (list, tuple)) and len(tok_item) >= 2:
+                                    tok_text = tok_item[0]
+                                else:
+                                    tok_text = str(tok_item)
+                                filtered.append(tok_text)
+                            if filtered:
+                                subjects_parsed[name] = filtered
+                
                 export_text = "📄 *Експорт даних*\n\n"
                 export_text += f"Період: {start} — {end}\n\n"
                 
