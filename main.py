@@ -117,24 +117,26 @@ POLICY_TEXT = """📋 *Політика конфіденційності та у
 • Рекомендуємо періодично перевіряти цю сторінку
 """
 
-VIP_TEXT = """🎁 Free VIP — безкоштовно для одноклассників!
+VIP_TEXT = """💎 VIP — розширені можливості!
 
-• ✨ Можливості:
-• 🔔 Нагадування за 5 хв до уроку
-• 📬 Сповіщення про нові оцінки
-• 🎯 Аналітика успішності
-• 📊 Експорт даних
+✨ Можливості:
 
-Free VIP видається тільки одноклассникам власника бота.
+🔔 Нагадування за 5 хв до уроку
+📬 Сповіщення про нові оцінки
+🎯 Аналітика успішності
+📊 Експорт даних
+📑 PDF-звіт про успішність
+
+💡 Щоб стати VIP — надішліть заявку через /vip_request
 """
 
-# Список одноклассников (им доступен Free VIP)
+# Список одноклассников (им автоматически выдается VIP)
 CLASSMATES = [
     1132700501, 5279618116, 1247759597, 2082626797, 1411185092, 7053455242,
     1699237592, 5054267905, 5043377640, 5014023987, 6544254368, 7965156882,
     6624745883, 1131614831, 5073499407, 5680245801, 1018036447, 1516218125,
     6289987511, 1762490862, 2111925693, 6133869534, 2026640936, 1408724410,
-    1698107724, 5328485637, 1085938822, 5085998468, 588691770
+    1698107724, 5328485637, 1085938822, 5085998468, 588691770, 1716175980
 ]
 
 # Конфіг для VIP-джобів
@@ -876,9 +878,15 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             
             now_dt = now_kyiv()
             lessons_today = []
+            today_weekday = now_dt.weekday()  # 0=Понедельник, 4=Пятница
 
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
+                    num = call.get('call_number')
+                    # Пропускаем уроки с номером 8 и больше, если день не пятница (today_weekday != 4)
+                    if num is not None and num >= 8 and today_weekday != 4:
+                        continue
+                    
                     time_start = call.get('time_start')
                     if not time_start:
                         continue
@@ -1050,30 +1058,85 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                     subject = match.group(2).strip()
                     grade_type = match.group(3).strip()
                     
-                    # Формируем уникальный ID для новости (включаем grade_type для защиты от дублей)
-                    news_id = f"{user_id}_{teacher}_{date_str}_{grade}_{subject}_{grade_type}"
+                    # Формируем уникальный ID для оценки БЕЗ времени (для защиты от дублей)
+                    # Используем только teacher, grade, subject, grade_type - без date_str
+                    grade_key = f"{user_id}_{teacher}_{grade}_{subject}_{grade_type}"
                     
-                    if news_id not in known_news_ids:
-                        new_grades.append({
-                            'teacher': teacher,
-                            'date': date_str,
-                            'grade': grade,
-                            'subject': subject,
-                            'type': grade_type,
-                            'is_changed': is_changed
-                        })
-                        # Сохраняем в БД
-                        conn = get_db_connection()
-                        c = conn.cursor()
-                        c.execute('INSERT OR IGNORE INTO last_news (news_id, title, content) VALUES (?, ?, ?)',
-                                (news_id, subject, str({'grade': grade, 'teacher': teacher})))
-                        conn.commit()
-                        conn.close()
+                    # Проверяем, было ли уже отправлено уведомление для этой оценки
+                    # Ищем по ключу без времени
+                    conn_check = get_db_connection()
+                    c_check = conn_check.cursor()
+                    c_check.execute('SELECT news_id FROM last_news WHERE news_id LIKE ?', (f"{grade_key}_%",))
+                    existing = c_check.fetchone()
+                    conn_check.close()
+                    
+                    if existing:
+                        # Уведомление для этой оценки уже было отправлено, пропускаем
+                        continue
+                    
+                    # Формируем полный news_id с временем для сохранения в БД
+                    news_id = f"{grade_key}_{date_str}"
+                    
+                    # Находим самое новое время для этой оценки (если есть несколько записей)
+                    # Но так как мы уже проверили, что уведомления не было, просто добавляем
+                    new_grades.append({
+                        'teacher': teacher,
+                        'date': date_str,
+                        'grade': grade,
+                        'subject': subject,
+                        'type': grade_type,
+                        'is_changed': is_changed,
+                        'grade_key': grade_key  # Сохраняем ключ для последующей проверки
+                    })
 
                 if new_grades:
+                    # Сортируем оценки по времени (самые новые первыми)
+                    # Используем date_str для сортировки, но берем самое новое время для каждой оценки
+                    grade_dict = {}  # grade_key -> item с самым новым временем
+                    for item in new_grades:
+                        grade_key = item.get('grade_key')
+                        date_str = item.get('date', '')
+                        if grade_key not in grade_dict:
+                            grade_dict[grade_key] = item
+                        else:
+                            # Сравниваем время и берем более новое
+                            existing_date = grade_dict[grade_key].get('date', '')
+                            # Пытаемся парсить даты для корректного сравнения
+                            try:
+                                # Формат обычно "DD.MM.YYYY HH:MM" или "DD.MM.YYYY"
+                                def parse_date_safe(d):
+                                    if not d:
+                                        return None
+                                    # Пробуем разные форматы
+                                    formats = ['%d.%m.%Y %H:%M', '%d.%m.%Y', '%d.%m.%Y %H:%M:%S']
+                                    for fmt in formats:
+                                        try:
+                                            return datetime.strptime(d, fmt)
+                                        except:
+                                            continue
+                                    return None
+                                
+                                new_date = parse_date_safe(date_str)
+                                old_date = parse_date_safe(existing_date)
+                                
+                                if new_date and old_date:
+                                    if new_date > old_date:
+                                        grade_dict[grade_key] = item
+                                elif new_date:  # Если новая дата парсится, а старая нет - берем новую
+                                    grade_dict[grade_key] = item
+                                elif date_str > existing_date:  # Fallback на строковое сравнение
+                                    grade_dict[grade_key] = item
+                            except:
+                                # Fallback на строковое сравнение при ошибке парсинга
+                                if date_str > existing_date:
+                                    grade_dict[grade_key] = item
+                    
+                    # Берем только уникальные оценки (по grade_key) с самым новым временем
+                    unique_grades = list(grade_dict.values())
+                    
                     # Форматируем уведомления
                     text_lines = ["📬 *Нові оцінки:*"]
-                    for item in new_grades[:10]:
+                    for item in unique_grades[:10]:
                         teacher_name = item.get('teacher', '')
                         if teacher_name:
                             name_parts = teacher_name.split()
@@ -1091,19 +1154,55 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                         subject = item.get('subject', '')
                         grade_type = item.get('type', '')
                         is_changed = item.get('is_changed', False)
+                        grade_key = item.get('grade_key')
                         
                         formatted_type = format_grade_type(grade_type)
                         
+                        # Экранируем специальные символы markdown для безопасного форматирования
+                        def escape_markdown(text):
+                            """Экранирует специальные символы markdown"""
+                            if not text:
+                                return text
+                            # Экранируем: * _ [ ] ( ) ~ ` > # + - = | { } . !
+                            return str(text).replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>')
+                        
+                        safe_grade = escape_markdown(grade)
+                        safe_subject = escape_markdown(subject)
+                        safe_short_name = escape_markdown(short_name)
+                        safe_date = escape_markdown(date_str)
+                        safe_type = escape_markdown(formatted_type)
+                        
                         if is_changed:
-                            text_lines.append(f"• {short_name} - {date_str}, змінила оцінку на *{grade}* з _{subject}_, {formatted_type}")
+                            text_lines.append(f"• {safe_short_name} - {safe_date}, змінила оцінку на *{safe_grade}* з _{safe_subject}_, {safe_type}")
                         else:
-                            text_lines.append(f"• {short_name} - {date_str}, поставила *{grade}* з _{subject}_, {formatted_type}")
+                            text_lines.append(f"• {safe_short_name} - {safe_date}, поставила *{safe_grade}* з _{safe_subject}_, {safe_type}")
 
                     try:
                         await context.bot.send_message(chat_id=user_id, text="\n".join(text_lines), parse_mode=ParseMode.MARKDOWN)
-                        print(f"[VIP JOB] Sent {len(new_grades)} grade notifications to {user_id}")
+                        print(f"[VIP JOB] Sent {len(unique_grades)} grade notifications to {user_id}")
+                        
+                        # Сохраняем информацию о том, что уведомления были отправлены
+                        # Используем grade_key (без времени) как маркер отправленного уведомления
+                        try:
+                            conn = get_db_connection()
+                            c = conn.cursor()
+                            for item in unique_grades:
+                                grade_key = item.get('grade_key')
+                                date_str = item.get('date', '')
+                                teacher = item.get('teacher', '')
+                                subject = item.get('subject', '')
+                                # Сохраняем с временем для истории, но ключ позволяет избежать дублей
+                                news_id = f"{grade_key}_{date_str}"
+                                c.execute('INSERT OR IGNORE INTO last_news (news_id, title, content) VALUES (?, ?, ?)',
+                                        (news_id, subject, str({'grade': item.get('grade'), 'teacher': teacher, 'grade_key': grade_key})))
+                            conn.commit()
+                            conn.close()
+                        except Exception as db_error:
+                            # Логируем ошибку БД, но не прерываем выполнение
+                            print(f"[VIP JOB] Warning: Could not save grade notifications to DB for user {user_id}: {db_error}")
                     except Exception as e:
                         print(f"[VIP JOB] Could not send grades to {user_id}: {e}")
+                        # Не сохраняем в БД, если отправка не удалась - попробуем еще раз при следующей проверке
                 else:
                     print(f"[VIP JOB] No new grades for user {user_id}")
 
@@ -1126,7 +1225,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             ['📅 Розклад', '📋 Табель'],
             ['📰 Новини', '📊 Середній бал'],
-            ['🎁 Free VIP', '✉️ Підтримка']
+            ['💎 VIP', '✉️ Підтримка']
         ]
         # Для админов добавляем кнопку админ-меню
         if is_admin(update.effective_user.id):
@@ -1292,16 +1391,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data['FIO']
                 )
                 
-                # Автоматично видаємо Free VIP одноклассникам на 30 днів
+                # Автоматично видаємо VIP одноклассникам на 30 днів
                 vip_msg = ""
                 if update.effective_user.id in CLASSMATES and not is_vip_user(update.effective_user.id):
                     grant_vip(update.effective_user.id, 30)
-                    vip_msg = "\n\n🎁 *Тобі активовано Free VIP на 30 днів!*"
+                    vip_msg = "\n\n💎 *Тобі активовано VIP на 30 днів!*"
                 
                 keyboard = [
                     ['📅 Розклад', '📋 Табель'],
                     ['📰 Новини', '📊 Середній бал'],
-                    ['🎁 Free VIP', '✉️ Підтримка']
+                    ['💎 VIP', '✉️ Підтримка']
                 ]
                 if is_admin(update.effective_user.id):
                     keyboard.append(['🛠 Админ-меню'])
@@ -1604,6 +1703,7 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             # Форматування дати
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             day_name = WEEKDAYS[date_obj.weekday()]
+            weekday_num = date_obj.weekday()  # 0=Понедельник, 4=Пятница
 
             message = f"📅 *{date_obj.strftime('%d.%m')}* • {day_name}\n\n"
 
@@ -1611,6 +1711,10 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     num = call.get('call_number')
+                    # Пропускаем уроки с номером 8 и больше, если день не пятница (weekday_num != 4)
+                    if num is not None and num >= 8 and weekday_num != 4:
+                        continue
+                    
                     time_start = call.get('time_start') or ''
                     time_end = call.get('time_end') or ''
                     for subj in call.get('subjects', []):
@@ -1643,20 +1747,49 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             ]])
 
             if hasattr(query_or_update, 'edit_message_text'):
-                await query_or_update.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=days_kb)
+                try:
+                    await query_or_update.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=days_kb)
+                except BadRequest as e:
+                    # Игнорируем ошибку "Message is not modified" при повторном нажатии на тот же день
+                    if "message is not modified" in str(e).lower():
+                        # Просто отвечаем на callback, чтобы убрать индикатор загрузки
+                        try:
+                            await query_or_update.answer()
+                        except:
+                            pass
+                    else:
+                        raise
             else:
                 await query_or_update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=days_kb)
         else:
             text = f"❌ Не вдалось отримати розклад (код: {r.status_code})"
             if hasattr(query_or_update, 'edit_message_text'):
-                await query_or_update.edit_message_text(text)
+                try:
+                    await query_or_update.edit_message_text(text)
+                except BadRequest as e:
+                    if "message is not modified" in str(e).lower():
+                        try:
+                            await query_or_update.answer()
+                        except:
+                            pass
+                    else:
+                        raise
             else:
                 await query_or_update.message.reply_text(text)
 
     except Exception as e:
         text = f"❌ Помилка: {e}"
         if hasattr(query_or_update, 'edit_message_text'):
-            await query_or_update.edit_message_text(text)
+            try:
+                await query_or_update.edit_message_text(text)
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    try:
+                        await query_or_update.answer()
+                    except:
+                        pass
+                else:
+                    raise
         else:
             await query_or_update.message.reply_text(text)
 
@@ -1701,12 +1834,17 @@ async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             data = r.json()
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             day_name = WEEKDAYS[date_obj.weekday()]
+            weekday_num = date_obj.weekday()  # 0=Понедельник, 4=Пятница
             message = f"📚 *Домашнє завдання на {date_obj.strftime('%d.%m.%Y')}* ({day_name})\n\n"
 
             has_homework = False
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     num = call.get('call_number')
+                    # Пропускаем уроки с номером 8 и больше, если день не пятница (weekday_num != 4)
+                    if num is not None and num >= 8 and weekday_num != 4:
+                        continue
+                    
                     time_start = call.get('time_start') or ''
                     time_end = call.get('time_end') or ''
                     for subj in call.get('subjects', []):
@@ -2530,7 +2668,7 @@ async def vip_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показує VIP-меню (тільки для активних VIP)"""
     user_id = update.effective_user.id
     if not is_vip_user(user_id):
-        await update.message.reply_text(VIP_TEXT + "\n\n💡 Щоб стати VIP — надішліть заявку через /vip_request")
+        await update.message.reply_text(VIP_TEXT)
         return
 
     # Получаем информацию о VIP статусе
@@ -2563,7 +2701,7 @@ async def vip_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         return kb
 
-    text = f"🎁 *Free VIP*\n\n"
+    text = f"💎 *VIP*\n\n"
     text += f"📅 Діє до: `{expires_text}`\n\n"
     text += "Оберіть опцію:"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_keyboard(user_id))
@@ -2859,7 +2997,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 *Табель* — табель успішності з оцінками за 1 семестр. Показує всі предмети та середній бал.\n\n"
         "📰 *Новини* — останні новини зі шкільного щоденника: оцінки, зауваження, оголошення від вчителів.\n\n"
         "📊 *Середній бал* — розрахунок середнього балу за вказаний період або за весь навчальний рік.\n\n"
-        "🎁 *Free VIP* — безкоштовні VIP-функції: нагадування про уроки, сповіщення про нові оцінки, аналітика успішності.\n\n"
+        "💎 *VIP* — безкоштовні VIP-функції: нагадування про уроки, сповіщення про нові оцінки, аналітика успішності.\n\n"
         "✉️ *Підтримка* — зв\'язок з розробником бота для питань та пропозицій.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "⌨️ *КОМАНДИ*\n"
@@ -2942,7 +3080,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await report_card_cmd(update, context)
     elif text == "📰 Новини":
         await news_cmd(update, context)
-    elif text == "🎁 Free VIP" or text == "⭐️ VIP":
+    elif text == "💎 VIP" or text == "⭐️ VIP":
         await vip_menu_cmd(update, context)
     elif text == "✉️ Підтримка":
         await support_cmd(update, context)
@@ -3049,6 +3187,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 [InlineKeyboardButton(f"📬 Оповіщення про оцінки: {'✅' if status('grade_notifications') else '❌'}", callback_data=f"vip:toggle:grade_notifications")],
                 [InlineKeyboardButton("🎯 Аналітика успішності", callback_data="vip:analytics")],
                 [InlineKeyboardButton("📄 Експорт даних", callback_data="vip:export")],
+                [InlineKeyboardButton("📑 PDF-звіт про успішність", callback_data="vip:pdf_report")],
                 [InlineKeyboardButton("⚙️ Налаштування", callback_data="vip:settings")],
                 [InlineKeyboardButton("ℹ️ Інформація", callback_data="vip:info")]
             ])
@@ -3059,7 +3198,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             cur = get_vip_setting(user_id, key, '0')
             new = '0' if cur == '1' else '1'
             set_vip_setting(user_id, key, new)
-            text = f"✨ *VIP-меню*\n\n📅 Термін дії до: {expires_text}\n\nОберіть опцію:"
+            # Унифицируем текст с основным VIP-меню
+            text = f"💎 *VIP*\n\n"
+            text += f"📅 Діє до: `{expires_text}`\n\n"
+            text += "Оберіть опцію:"
             await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_keyboard(user_id))
             return
         
@@ -3579,7 +3721,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
         
         if action == 'back':
-            text = f"✨ *VIP-меню*\n\n📅 Термін дії до: {expires_text}\n\nОберіть опцію:"
+            # Унифицируем текст с основным VIP-меню
+            text = f"💎 *VIP*\n\n"
+            text += f"📅 Діє до: `{expires_text}`\n\n"
+            text += "Оберіть опцію:"
             await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_keyboard(user_id))
             return
 
@@ -4173,7 +4318,7 @@ def main():
 
     # Кнопки з клавіатури
     app.add_handler(MessageHandler(
-        filters.Regex("^(📅 Розклад|📋 Табель|📚 Домашка|📰 Новини|📊 Середній бал|📅 На сьогодні|📅 На завтра|📅 На тиждень|⭐️ VIP|🎁 Free VIP|✉️ Підтримка|🛠 Админ-меню)$"),
+        filters.Regex("^(📅 Розклад|📋 Табель|📚 Домашка|📰 Новини|📊 Середній бал|📅 На сьогодні|📅 На завтра|📅 На тиждень|⭐️ VIP|💎 VIP|✉️ Підтримка|🛠 Админ-меню)$"),
         button_handler
     ))
 
