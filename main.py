@@ -8,6 +8,14 @@ from telegram.error import BadRequest
 
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# Timezone для Украины
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def now_kyiv() -> datetime:
+    """Возвращает текущее время в Europe/Kyiv"""
+    return datetime.now(KYIV_TZ)
 import json
 import re
 import base64
@@ -656,7 +664,7 @@ def is_vip_user(user_id: int) -> bool:
     if row and row[0]:
         try:
             expires = datetime.fromisoformat(row[0])
-            return expires > datetime.now()
+            return expires > now_kyiv()
         except Exception:
             return False
     return False
@@ -665,7 +673,7 @@ def is_vip_user(user_id: int) -> bool:
 
 def grant_vip(user_id: int, days: int = 30):
     """Надає VIP на вказану кількість днів"""
-    expires_at = (datetime.now() + timedelta(days=days)).isoformat()
+    expires_at = (now_kyiv() + timedelta(days=days)).isoformat()
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('INSERT OR REPLACE INTO vip_users (user_id, expires_at, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
@@ -796,7 +804,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     print("[VIP JOB] Checking reminders...")
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (datetime.now().isoformat(),))
+    c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
     users = c.fetchall()
     conn.close()
     
@@ -820,7 +828,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 print(f"[VIP JOB] User {user_id} has reminders disabled; skipping")
                 continue
 
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = now_kyiv().strftime('%Y-%m-%d')
             
             # Пробуем получить расписание через API
             try:
@@ -863,7 +871,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 print(f"[VIP JOB] Could not parse JSON for user {user_id}: {e}")
                 continue
             
-            now_dt = datetime.now()
+            now_dt = now_kyiv()
             lessons_today = []
 
             for day in data.get('dates', []):
@@ -881,6 +889,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     
                     try:
                         lesson_dt = datetime.strptime(f"{today} {time_start}", "%Y-%m-%d %H:%M")
+                        lesson_dt = lesson_dt.replace(tzinfo=KYIV_TZ)
                     except Exception:
                         continue
 
@@ -922,7 +931,7 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
     print("[VIP JOB] Checking grades from news")
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (datetime.now().isoformat(),))
+    c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
     users = c.fetchall()
     conn.close()
 
@@ -1036,8 +1045,8 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                     subject = match.group(2).strip()
                     grade_type = match.group(3).strip()
                     
-                    # Формируем уникальный ID для новости (включаем user_id)
-                    news_id = f"{user_id}_{teacher}_{date_str}_{grade}_{subject}"
+                    # Формируем уникальный ID для новости (включаем grade_type для защиты от дублей)
+                    news_id = f"{user_id}_{teacher}_{date_str}_{grade}_{subject}_{grade_type}"
                     
                     if news_id not in known_news_ids:
                         new_grades.append({
@@ -1429,7 +1438,7 @@ async def show_weekday_keyboard(update: Update, context: ContextTypes.DEFAULT_TY
         buttons.append([InlineKeyboardButton(day, callback_data=f"{kind}:{day}")])
     
     # Додаємо кнопку "Сьогодні"
-    today_weekday = datetime.now().weekday()
+    today_weekday = now_kyiv().weekday()
     today_name = WEEKDAYS[today_weekday]
     buttons.insert(0, [InlineKeyboardButton(f"📍 Сьогодні ({today_name})", callback_data=f"{kind}:today")])
     
@@ -1441,7 +1450,7 @@ async def show_weekday_keyboard(update: Update, context: ContextTypes.DEFAULT_TY
 async def get_date_for_weekday(day_name: str) -> str:
     """Конвертує назву дня у дату"""
     if day_name == 'today':
-        return datetime.now().strftime('%Y-%m-%d')
+        return now_kyiv().strftime('%Y-%m-%d')
     
     mapping = {
         'Понеділок': 0,
@@ -1451,7 +1460,7 @@ async def get_date_for_weekday(day_name: str) -> str:
         "П'ятниця": 4
     }
     
-    today = datetime.now()
+    today = now_kyiv()
     monday = today - timedelta(days=today.weekday())
     target = monday + timedelta(days=mapping.get(day_name, 0))
     
@@ -4157,7 +4166,7 @@ def main():
     
     # Токен бота - задається через змінну середовища TELEGRAM_BOT_TOKEN або вбудований в код
     print("[STARTUP] main() reached: checking BOT_TOKEN...")
-    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7693623960:AAHjwDrkt6OhBImU-BmaJK2nZMjvk7a0U6Y")
     # do not print token value raw; show masked info
     try:
         print(f"[STARTUP] BOT_TOKEN present: {bool(BOT_TOKEN)} length={len(BOT_TOKEN) if BOT_TOKEN else 0}")
