@@ -35,7 +35,10 @@ except Exception:
     CRYPTO_AVAILABLE = False
 
 API_BASE = "https://api-mobile.nz.ua"
-scraper = cloudscraper.create_scraper()
+
+def get_scraper():
+    """Створює новий екземпляр scraper для ізоляції cookies між користувачами"""
+    return cloudscraper.create_scraper()
 
 # База даних
 # На Railway volume монтується на /data, локально використовуємо data/
@@ -298,7 +301,7 @@ async def refresh_session(user_id: int):
         return None
     
     try:
-        r = scraper.post(f"{API_BASE}/v1/user/login", json={
+        r = get_scraper().post(f"{API_BASE}/v1/user/login", json={
             "username": session['username'],
             "password": session['password']
         })
@@ -832,7 +835,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             
             # Пробуем получить расписание через API
             try:
-                r = scraper.post(
+                r = get_scraper().post(
                     f"{API_BASE}/v1/schedule/timetable",
                     headers={"Authorization": f"Bearer {session['token']}"},
                     json={"student_id": session['student_id'], "start_date": today, "end_date": today},
@@ -848,7 +851,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 if new_s:
                     session = new_s
                     try:
-                        r = scraper.post(
+                        r = get_scraper().post(
                             f"{API_BASE}/v1/schedule/timetable",
                             headers={"Authorization": f"Bearer {session['token']}"},
                             json={"student_id": session['student_id'], "start_date": today, "end_date": today},
@@ -952,7 +955,9 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
             try:
                 from bs4 import BeautifulSoup
                 login_url = "https://nz.ua/login"
-                login_page = scraper.get(login_url)
+                # Створюємо один scraper для всієї сесії веб-логіну
+                web_scraper = get_scraper()
+                login_page = web_scraper.get(login_url)
                 login_soup = BeautifulSoup(login_page.text, "html.parser")
                 csrf = None
                 meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
@@ -972,7 +977,7 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                     login_data['_csrf'] = csrf
                     headers['X-CSRF-Token'] = csrf
 
-                scraper.post(login_url, data=login_data, headers=headers)
+                web_scraper.post(login_url, data=login_data, headers=headers)
 
                 # Получаем новости
                 endpoints = ["/dashboard/news", "/dashboard", "/news", "/site/news"]
@@ -982,7 +987,7 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                 for ep in endpoints:
                     url = urljoin(base_url, ep)
                     try:
-                        resp = scraper.get(url)
+                        resp = web_scraper.get(url)
                         if resp.status_code == 200 and ('Мої новини' in resp.text or 'school-news-list' in resp.text):
                             news_resp = resp
                             break
@@ -1269,7 +1274,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         
         try:
-            r = scraper.post(f"{API_BASE}/v1/user/login", json={
+            r = get_scraper().post(f"{API_BASE}/v1/user/login", json={
                 "username": login,
                 "password": password
             })
@@ -1516,7 +1521,7 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     try:
-        r = scraper.post(
+        r = get_scraper().post(
             f"{API_BASE}/v1/schedule/timetable",
             headers={"Authorization": f"Bearer {session['token']}"},
             json={
@@ -1530,7 +1535,7 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         if r.status_code == 401:
             new_session = await refresh_session(user_id)
             if new_session:
-                r = scraper.post(
+                r = get_scraper().post(
                     f"{API_BASE}/v1/schedule/timetable",
                     headers={"Authorization": f"Bearer {new_session['token']}"},
                     json={
@@ -1548,7 +1553,7 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
                 return
 
         # Получаем домашку из diary
-        r_hw = scraper.post(
+        r_hw = get_scraper().post(
             f"{API_BASE}/v1/schedule/diary",
             headers={"Authorization": f"Bearer {session['token']}"},
             json={
@@ -1562,7 +1567,7 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             new_session = await refresh_session(user_id)
             if new_session:
                 session = new_session
-                r_hw = scraper.post(
+                r_hw = get_scraper().post(
                     f"{API_BASE}/v1/schedule/diary",
                     headers={"Authorization": f"Bearer {session['token']}"},
                     json={
@@ -1670,7 +1675,7 @@ async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     try:
-        r = scraper.post(
+        r = get_scraper().post(
             f"{API_BASE}/v1/schedule/diary",
             headers={"Authorization": f"Bearer {session['token']}"},
             json={"student_id": session['student_id'], "start_date": date, "end_date": date}
@@ -1679,7 +1684,7 @@ async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
         if r.status_code == 401:
             new_session = await refresh_session(user_id)
             if new_session:
-                r = scraper.post(
+                r = get_scraper().post(
                     f"{API_BASE}/v1/schedule/diary",
                     headers={"Authorization": f"Bearer {new_session['token']}"},
                     json={"student_id": new_session['student_id'], "start_date": date, "end_date": date}
@@ -1808,7 +1813,7 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         last_exc = None
         # First, try to use the API response
-        r = scraper.post(
+        r = get_scraper().post(
             f"{API_BASE}/v1/schedule/student-performance",
             headers={"Authorization": f"Bearer {session['token']}"},
             json={
@@ -1823,7 +1828,7 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[AVG] API returned 401, attempting refresh")
                 new_session = await refresh_session(update.effective_user.id)
                 if new_session:
-                    r = scraper.post(
+                    r = get_scraper().post(
                         f"{API_BASE}/v1/schedule/student-performance",
                         headers={"Authorization": f"Bearer {new_session['token']}"},
                         json={
@@ -1899,9 +1904,11 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     gresp = None
                     last_exc = None
                     headers = {'User-Agent': 'nz-bot/1.0 (+https://nz.ua)', 'Referer': grades_url}
+                    # Створюємо один scraper для всієї сесії веб-логіну
+                    web_scraper = get_scraper()
                     for attempt in range(4):
                         try:
-                            gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                            gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
                             if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                                 grades_html = gresp.text
                                 break
@@ -1911,7 +1918,7 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         # Try logging in and retry
                         try:
                             login_url = "https://nz.ua/login"
-                            page = scraper.get(login_url, timeout=10, headers=headers)
+                            page = web_scraper.get(login_url, timeout=10, headers=headers)
                             csrf = None
                             from bs4 import BeautifulSoup
                             login_soup = BeautifulSoup(page.text, 'html.parser')
@@ -1932,10 +1939,10 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 login_data['_csrf'] = csrf
                                 lheaders['X-CSRF-Token'] = csrf
 
-                            scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
+                            web_scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
                             # retry fetch after login
                             try:
-                                gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                                gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
                                 if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                                     grades_html = gresp.text
                                     break
@@ -1971,7 +1978,7 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         grades_url = f"https://nz.ua/schedule/grades-statement"
                         params = {'student_id': session['student_id']}
                         headers = {'User-Agent': 'nz-bot/1.0 (+https://nz.ua)', 'Referer': grades_url}
-                        gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                        gresp = get_scraper().get(grades_url, params=params, timeout=10, headers=headers)
                         if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                             grades_html = gresp.text
                             print(f"[AVG] HTML loaded in fallback attempt")
@@ -2294,10 +2301,13 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from bs4 import BeautifulSoup
 
         login_url = "https://nz.ua/login"
+        
+        # Створюємо один scraper для всієї сесії веб-логіну
+        web_scraper = get_scraper()
 
         # Спроба: спочатку отримати сторінку логіну і витягти CSRF токен
         try:
-            login_page = scraper.get(login_url)
+            login_page = web_scraper.get(login_url)
             login_soup = BeautifulSoup(login_page.text, "html.parser")
             csrf = None
             meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
@@ -2327,10 +2337,10 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             headers['X-CSRF-Token'] = csrf
 
         # Виконуємо логін (спробуємо один раз, потім перевіримо сторінку новин)
-        r_login = scraper.post(login_url, data=login_data, headers=headers)
+        r_login = web_scraper.post(login_url, data=login_data, headers=headers)
         print(f"[NEWS] Login status: {r_login.status_code}, URL after login: {r_login.url}")
         try:
-            print("[NEWS] Cookies after login:", scraper.cookies.get_dict())
+            print("[NEWS] Cookies after login:", web_scraper.cookies.get_dict())
         except Exception:
             pass
 
@@ -2342,7 +2352,7 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for ep in endpoints:
             url = urljoin(base_url, ep)
             try:
-                resp = scraper.get(url)
+                resp = web_scraper.get(url)
                 print(f"[NEWS] GET {url} -> {resp.status_code}")
                 if resp.status_code == 200 and 'Мої новини' in resp.text or 'school-news-list' in resp.text:
                     news_resp = resp
@@ -2658,7 +2668,9 @@ async def report_card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         login_url = "https://nz.ua/login"
         headers = {'User-Agent': 'nz-bot/1.0'}
         
-        login_page = scraper.get(login_url, headers=headers)
+        # Створюємо один scraper для всієї сесії веб-логіну
+        web_scraper = get_scraper()
+        login_page = web_scraper.get(login_url, headers=headers)
         login_soup = BeautifulSoup(login_page.text, "html.parser")
         
         csrf = None
@@ -2678,10 +2690,10 @@ async def report_card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             login_data['_csrf'] = csrf
             headers['X-CSRF-Token'] = csrf
         
-        scraper.post(login_url, data=login_data, headers=headers)
+        web_scraper.post(login_url, data=login_data, headers=headers)
         
         report_url = "https://nz.ua/schedule/report-card"
-        report_resp = scraper.get(report_url, headers=headers)
+        report_resp = web_scraper.get(report_url, headers=headers)
         
         if report_resp.status_code != 200 or 'Табель' not in report_resp.text:
             await msg.edit_text("❌ Не вдалося завантажити табель. Спробуйте пізніше.")
@@ -3070,7 +3082,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 start = aug1.strftime('%Y-%m-%d')
                 end = today.strftime('%Y-%m-%d')
                 
-                r = scraper.post(
+                r = get_scraper().post(
                     f"{API_BASE}/v1/schedule/student-performance",
                     headers={"Authorization": f"Bearer {session['token']}"},
                     json={"student_id": session['student_id'], "start_date": start, "end_date": end}
@@ -3080,7 +3092,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     new_session = await refresh_session(user_id)
                     if new_session:
                         session = new_session
-                        r = scraper.post(
+                        r = get_scraper().post(
                             f"{API_BASE}/v1/schedule/student-performance",
                             headers={"Authorization": f"Bearer {session['token']}"},
                             json={"student_id": session['student_id'], "start_date": start, "end_date": end}
@@ -3118,10 +3130,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     headers = {'User-Agent': 'nz-bot/1.0 (+https://nz.ua)', 'Referer': grades_url}
                     grades_html = None
                     
+                    # Створюємо один scraper для всієї сесії веб-логіну
+                    web_scraper = get_scraper()
                     # Пробуем несколько раз с логином (как в avg)
                     for attempt in range(4):
                         try:
-                            gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                            gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
                             if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                                 grades_html = gresp.text
                                 break
@@ -3131,7 +3145,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                         # Try logging in and retry
                         try:
                             login_url = "https://nz.ua/login"
-                            page = scraper.get(login_url, timeout=10, headers=headers)
+                            page = web_scraper.get(login_url, timeout=10, headers=headers)
                             csrf = None
                             from bs4 import BeautifulSoup
                             login_soup = BeautifulSoup(page.text, 'html.parser')
@@ -3152,10 +3166,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                                 login_data['_csrf'] = csrf
                                 lheaders['X-CSRF-Token'] = csrf
                             
-                            scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
+                            web_scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
                             # retry fetch after login
                             try:
-                                gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                                gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
                                 if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                                     grades_html = gresp.text
                                     break
@@ -3252,7 +3266,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 start = aug1.strftime('%Y-%m-%d')
                 end = today.strftime('%Y-%m-%d')
                 
-                r = scraper.post(
+                r = get_scraper().post(
                     f"{API_BASE}/v1/schedule/student-performance",
                     headers={"Authorization": f"Bearer {session['token']}"},
                     json={"student_id": session['student_id'], "start_date": start, "end_date": end}
@@ -3262,7 +3276,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     new_session = await refresh_session(user_id)
                     if new_session:
                         session = new_session
-                        r = scraper.post(
+                        r = get_scraper().post(
                             f"{API_BASE}/v1/schedule/student-performance",
                             headers={"Authorization": f"Bearer {session['token']}"},
                             json={"student_id": session['student_id'], "start_date": start, "end_date": end}
@@ -3297,70 +3311,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 if not subjects_parsed:
                     grades_url = f"https://nz.ua/schedule/grades-statement"
                     params = {'student_id': session['student_id']}
-                    headers = {'User-Agent': 'nz-bot/1.0 (+https://nz.ua)', 'Referer': grades_url}
-                    grades_html = None
-                    
-                    # Пробуем несколько раз с логином (как в avg)
-                    for attempt in range(4):
-                        try:
-                            gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
-                            if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
-                                grades_html = gresp.text
-                                break
-                        except Exception as exc:
-                            pass
-                        
-                        # Try logging in and retry
-                        try:
-                            login_url = "https://nz.ua/login"
-                            page = scraper.get(login_url, timeout=10, headers=headers)
-                            csrf = None
-                            from bs4 import BeautifulSoup
-                            login_soup = BeautifulSoup(page.text, 'html.parser')
-                            meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
-                            if meta_csrf:
-                                csrf = meta_csrf.get('content')
-                            hidden_csrf = login_soup.find('input', {'name': '_csrf'})
-                            if hidden_csrf and hidden_csrf.get('value'):
-                                csrf = hidden_csrf.get('value')
-                            
-                            login_data = {
-                                "LoginForm[login]": session['username'],
-                                "LoginForm[password]": session['password'],
-                                "LoginForm[rememberMe]": "1"
-                            }
-                            lheaders = {'Referer': grades_url}
-                            if csrf:
-                                login_data['_csrf'] = csrf
-                                lheaders['X-CSRF-Token'] = csrf
-                            
-                            scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
-                            # retry fetch after login
-                            try:
-                                gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
-                                if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
-                                    grades_html = gresp.text
-                                    break
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        
-                        time.sleep(1)
-                    
-                    if grades_html:
-                        sd, ed, subs = parse_grades_from_html(grades_html)
-                        for name, toks in subs.items():
-                            filtered = []
-                            for tok_item in toks:
-                                if isinstance(tok_item, (list, tuple)) and len(tok_item) >= 2:
-                                    tok_text = tok_item[0]
-                                else:
-                                    tok_text = str(tok_item)
-                                filtered.append(tok_text)
-                            if filtered:
-                                subjects_parsed[name] = filtered
-                
                 export_text = "📄 *Експорт даних*\n\n"
                 export_text += f"Період: {start} — {end}\n\n"
                 
@@ -3406,7 +3356,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 start = aug1.strftime('%Y-%m-%d')
                 end = today.strftime('%Y-%m-%d')
                 
-                r = scraper.post(
+                r = get_scraper().post(
                     f"{API_BASE}/v1/schedule/student-performance",
                     headers={"Authorization": f"Bearer {session['token']}"},
                     json={"student_id": session['student_id'], "start_date": start, "end_date": end}
@@ -3416,7 +3366,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     new_session = await refresh_session(user_id)
                     if new_session:
                         session = new_session
-                        r = scraper.post(
+                        r = get_scraper().post(
                             f"{API_BASE}/v1/schedule/student-performance",
                             headers={"Authorization": f"Bearer {session['token']}"},
                             json={"student_id": session['student_id'], "start_date": start, "end_date": end}
@@ -3453,9 +3403,11 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     headers = {'User-Agent': 'nz-bot/1.0 (+https://nz.ua)', 'Referer': grades_url}
                     grades_html = None
                     
+                    # Створюємо один scraper для всієї сесії веб-логіну
+                    web_scraper = get_scraper()
                     for attempt in range(4):
                         try:
-                            gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                            gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
                             if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                                 grades_html = gresp.text
                                 break
@@ -3464,7 +3416,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                         
                         try:
                             login_url = "https://nz.ua/login"
-                            page = scraper.get(login_url, timeout=10, headers=headers)
+                            page = web_scraper.get(login_url, timeout=10, headers=headers)
                             csrf = None
                             from bs4 import BeautifulSoup
                             login_soup = BeautifulSoup(page.text, 'html.parser')
@@ -3485,9 +3437,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                                 login_data['_csrf'] = csrf
                                 lheaders['X-CSRF-Token'] = csrf
                             
-                            scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
+                            web_scraper.post(login_url, data=login_data, headers=lheaders, timeout=10)
                             try:
-                                gresp = scraper.get(grades_url, params=params, timeout=10, headers=headers)
+                                gresp = web_scraper.get(grades_url, params=params, timeout=10, headers=headers)
                                 if gresp and gresp.status_code == 200 and ('Виписка оцінок' in gresp.text or 'Отримані результати' in gresp.text):
                                     grades_html = gresp.text
                                     break
