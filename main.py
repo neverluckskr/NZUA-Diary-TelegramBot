@@ -240,6 +240,14 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(news_id)
     )''')
+    
+    # Таблиця налаштувань дня з 8 уроками
+    c.execute('''CREATE TABLE IF NOT EXISTS user_8th_lesson_day (
+        user_id INTEGER PRIMARY KEY,
+        day_weekday INTEGER,
+        has_8th_lesson INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
 
     # Міграція: додати колонки до таблиці support_tickets, якщо їх немає
     c.execute("PRAGMA table_info(support_tickets)")
@@ -275,6 +283,26 @@ def save_session(user_id: int, username: str, password: str, token: str, student
                  (user_id, username, password, token, student_id, fio, last_login) 
                  VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
               (user_id, username, encrypted_password, encrypted_token, student_id, fio))
+    conn.commit()
+    conn.close()
+
+def get_user_8th_lesson_day(user_id: int):
+    """Получает настройку дня с 8 уроками для пользователя"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT day_weekday, has_8th_lesson FROM user_8th_lesson_day WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0], row[1]  # day_weekday, has_8th_lesson
+    return None, 0  # Нет настройки, по умолчанию нет 8 уроков
+
+def save_user_8th_lesson_day(user_id: int, day_weekday: int = None, has_8th_lesson: int = 0):
+    """Сохраняет настройку дня с 8 уроками для пользователя"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO user_8th_lesson_day (user_id, day_weekday, has_8th_lesson) VALUES (?, ?, ?)',
+              (user_id, day_weekday, has_8th_lesson))
     conn.commit()
     conn.close()
 
@@ -879,13 +907,22 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             now_dt = now_kyiv()
             lessons_today = []
             today_weekday = now_dt.weekday()  # 0=Понедельник, 4=Пятница
+            
+            # Получаем настройку дня с 8 уроками для пользователя
+            user_8th_day, has_8th = get_user_8th_lesson_day(user_id)
 
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     num = call.get('call_number')
-                    # Пропускаем уроки с номером 8 и больше, если день не пятница (today_weekday != 4)
-                    if num is not None and num >= 8 and today_weekday != 4:
-                        continue
+                    # Пропускаем уроки с номером 8 и больше в зависимости от настройки пользователя
+                    if num is not None and num >= 8:
+                        if has_8th == 0:
+                            # У пользователя нет 8 уроков - пропускаем все 8+
+                            continue
+                        elif has_8th == 1 and user_8th_day is not None:
+                            # У пользователя есть 8 уроков только в определенный день
+                            if today_weekday != user_8th_day:
+                                continue
                     
                     time_start = call.get('time_start')
                     if not time_start:
@@ -1397,6 +1434,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     grant_vip(update.effective_user.id, 30)
                     vip_msg = "\n\n💎 *Тобі активовано VIP на 30 днів!*"
                 
+                # Проверяем, есть ли настройка дня с 8 уроками
+                day_weekday, has_8th = get_user_8th_lesson_day(update.effective_user.id)
+                
+                if day_weekday is None and has_8th == 0:
+                    # Спрашиваем про 8 уроков
+                    kb_8th = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Так", callback_data="setup_8th:yes")],
+                        [InlineKeyboardButton("Ні", callback_data="setup_8th:no")]
+                    ])
+                    await update.message.reply_text(
+                        f"✅ Вітаю, {data['FIO']}!\n\n"
+                        f"🎓 ID учня: {data['student_id']}\n\n"
+                        f"❓ Чи є у вас 8 уроків на тиждень?{vip_msg}",
+                        reply_markup=kb_8th,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    return
+                
                 keyboard = [
                     ['📅 Розклад', '📋 Табель'],
                     ['📰 Новини', '📊 Середній бал'],
@@ -1704,6 +1759,9 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             day_name = WEEKDAYS[date_obj.weekday()]
             weekday_num = date_obj.weekday()  # 0=Понедельник, 4=Пятница
+            
+            # Получаем настройку дня с 8 уроками для пользователя
+            user_8th_day, has_8th = get_user_8th_lesson_day(user_id)
 
             message = f"📅 *{date_obj.strftime('%d.%m')}* • {day_name}\n\n"
 
@@ -1711,9 +1769,15 @@ async def schedule_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     num = call.get('call_number')
-                    # Пропускаем уроки с номером 8 и больше, если день не пятница (weekday_num != 4)
-                    if num is not None and num >= 8 and weekday_num != 4:
-                        continue
+                    # Пропускаем уроки с номером 8 и больше в зависимости от настройки пользователя
+                    if num is not None and num >= 8:
+                        if has_8th == 0:
+                            # У пользователя нет 8 уроков - пропускаем все 8+
+                            continue
+                        elif has_8th == 1 and user_8th_day is not None:
+                            # У пользователя есть 8 уроков только в определенный день
+                            if weekday_num != user_8th_day:
+                                continue
                     
                     time_start = call.get('time_start') or ''
                     time_end = call.get('time_end') or ''
@@ -1835,15 +1899,25 @@ async def homework_for_date(query_or_update, context: ContextTypes.DEFAULT_TYPE,
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             day_name = WEEKDAYS[date_obj.weekday()]
             weekday_num = date_obj.weekday()  # 0=Понедельник, 4=Пятница
+            
+            # Получаем настройку дня с 8 уроками для пользователя
+            user_8th_day, has_8th = get_user_8th_lesson_day(user_id)
+            
             message = f"📚 *Домашнє завдання на {date_obj.strftime('%d.%m.%Y')}* ({day_name})\n\n"
 
             has_homework = False
             for day in data.get('dates', []):
                 for call in day.get('calls', []):
                     num = call.get('call_number')
-                    # Пропускаем уроки с номером 8 и больше, если день не пятница (weekday_num != 4)
-                    if num is not None and num >= 8 and weekday_num != 4:
-                        continue
+                    # Пропускаем уроки с номером 8 и больше в зависимости от настройки пользователя
+                    if num is not None and num >= 8:
+                        if has_8th == 0:
+                            # У пользователя нет 8 уроков - пропускаем все 8+
+                            continue
+                        elif has_8th == 1 and user_8th_day is not None:
+                            # У пользователя есть 8 уроков только в определенный день
+                            if weekday_num != user_8th_day:
+                                continue
                     
                     time_start = call.get('time_start') or ''
                     time_end = call.get('time_end') or ''
@@ -3095,6 +3169,84 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробник callback-запитів (інлайн кнопки)"""
     query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+
+    # Обработка настройки дня с 8 уроками
+    if data and data.startswith('setup_8th:'):
+        action = data.split(':')[1]
+        
+        if action == 'no':
+            # Сохраняем, что у пользователя нет 8 уроков
+            save_user_8th_lesson_day(user_id, day_weekday=None, has_8th_lesson=0)
+            
+            keyboard = [
+                ['📅 Розклад', '📋 Табель'],
+                ['📰 Новини', '📊 Середній бал'],
+                ['💎 VIP', '✉️ Підтримка']
+            ]
+            if is_admin(user_id):
+                keyboard.append(['🛠 Админ-меню'])
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await query.edit_message_text(
+                "✅ Налаштування збережено!\n\n"
+                "Обирай функцію з меню нижче 👇",
+                reply_markup=None
+            )
+            await query.message.reply_text(
+                "Обирай функцію з меню нижче 👇",
+                reply_markup=reply_markup
+            )
+            await query.answer()
+            return
+        
+        elif action == 'yes':
+            # Показываем выбор дня недели
+            kb_days = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Пн", callback_data="setup_8th_day:0"),
+                    InlineKeyboardButton("Вт", callback_data="setup_8th_day:1"),
+                    InlineKeyboardButton("Ср", callback_data="setup_8th_day:2")
+                ],
+                [
+                    InlineKeyboardButton("Чт", callback_data="setup_8th_day:3"),
+                    InlineKeyboardButton("Пт", callback_data="setup_8th_day:4")
+                ]
+            ])
+            await query.edit_message_text(
+                "📅 Оберіть день тижня, коли у вас є 8 уроків:",
+                reply_markup=kb_days
+            )
+            await query.answer()
+            return
+    
+    if data and data.startswith('setup_8th_day:'):
+        day_weekday = int(data.split(':')[1])
+        # Сохраняем выбранный день
+        save_user_8th_lesson_day(user_id, day_weekday=day_weekday, has_8th_lesson=1)
+        
+        day_names = ['Понеділок', 'Вівторок', 'Середа', 'Четвер', "П'ятниця"]
+        keyboard = [
+            ['📅 Розклад', '📋 Табель'],
+            ['📰 Новини', '📊 Середній бал'],
+            ['💎 VIP', '✉️ Підтримка']
+        ]
+        if is_admin(user_id):
+            keyboard.append(['🛠 Админ-меню'])
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await query.edit_message_text(
+            f"✅ Налаштування збережено!\n\n"
+            f"8+ уроки будуть показуватися тільки в {day_names[day_weekday]}.",
+            reply_markup=None
+        )
+        await query.message.reply_text(
+            "Обирай функцію з меню нижче 👇",
+            reply_markup=reply_markup
+        )
+        await query.answer()
+        return
 
     # Safe answer to avoid crashing when query is too old
     async def _safe_answer(q, text=None, show_alert=False):
