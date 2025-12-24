@@ -1,9 +1,17 @@
-# Python
+# ==========================================
+# NZ.UA Telegram Bot - .gitignore
+# ==========================================
+
+# Python bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+*.pyo
+*.pyd
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -19,54 +27,147 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Virtual Environment
+# Virtual environments
 venv/
 env/
 ENV/
 env.bak/
 venv.bak/
+.venv/
+.conda/
+conda-meta/
+
+# ==========================================
+# SENSITIVE DATA - NEVER COMMIT!
+# ==========================================
 
 # Database files
 *.db
 *.sqlite
 *.sqlite3
 nz_bot.db
+data/
 
-# Encryption keys
+# Encryption keys (CRITICAL!)
 bot_encryption.key
 *.key
+*.pem
+*.crt
 
-# Environment variables
+# Environment variables (tokens, passwords)
 .env
+.env.*
 .env.local
-.env.*.local
+.env.production
+.env.development
+*.env
 
-# IDE
+# ==========================================
+# IDE & Editors
+# ==========================================
+
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+*.code-workspace
 
-# OS
+# ==========================================
+# OS generated files
+# ==========================================
+
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 desktop.ini
+$RECYCLE.BIN/
 
-# Debug files
-news_debug.html
+# ==========================================
+# Debug & Logs
+# ==========================================
+
 *.log
 *.log.*
+logs/
+debug/
+news_debug.html
+*.html.debug
 
-# CSV exports (may contain sensitive data)
+# ==========================================
+# Export files (may contain user data)
+# ==========================================
+
 csv/
 *.csv
+exports/
+*.xlsx
+*.xls
+*.json.backup
+
+# ==========================================
+# Temporary & Cache files
+# ==========================================
+
+*.tmp
+*.temp
+*.bak
+*.backup
+*.cache
+.cache/
+tmp/
+temp/
+
+# ==========================================
+# Testing
+# ==========================================
+
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+test_*.py
+*_test.py
+
+# ==========================================
+# Other
+# ==========================================
 
 # Session files
 sessions.accdb
+*.session
 
-# Temporary files
-*.tmp
-*.temp
+# Fix scripts (temporary)
+fix_*.py
+update_*.py
+add_*.py
 
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyright
+pyrightconfig.json

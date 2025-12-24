@@ -24,6 +24,8 @@ from urllib.parse import urljoin, urlparse
 import html
 import time
 import threading
+import asyncio
+import gc
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from report_card_parser import parse_report_card
 
@@ -140,10 +142,10 @@ CLASSMATES = [
 ]
 
 # Конфіг для VIP-джобів
-REMINDER_MINUTES = 5  # сколько минут до урока отправлять напоминание
-REMINDER_INTERVAL = 60  # проверять каждые N секунд
-GRADE_POLL_INTERVAL = 300  # проверять оценки каждые N секунд
-GRADES_LOOKBACK_DAYS = 30  # сколько дней смотреть на оценки
+REMINDER_MINUTES = int(os.getenv("REMINDER_MINUTES", "5"))  # сколько минут до урока отправлять напоминание
+REMINDER_INTERVAL = int(os.getenv("REMINDER_INTERVAL", "120"))  # проверять каждые N секунд (default 120s)
+GRADE_POLL_INTERVAL = int(os.getenv("GRADE_POLL_INTERVAL", "600"))  # проверять оценки каждые N секунд (default 600s)
+GRADES_LOOKBACK_DAYS = int(os.getenv("GRADES_LOOKBACK_DAYS", "30"))  # сколько дней смотреть на оценки
 PING_URL = os.getenv("PING_URL")
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", "600"))  # каждые N секунд слать пинг, по умолчанию 10 минут
 
@@ -835,51 +837,41 @@ def is_admin(user_id: int) -> bool:
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет расписание VIP-пользователей и отправляет напоминания за REMINDER_MINUTES"""
     print("[VIP JOB] Checking reminders...")
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
-    users = c.fetchall()
-    conn.close()
-    
-    if not users:
-        print("[VIP JOB] No active VIP users found")
+    if 'REMINDERS_LOCK' in globals() and REMINDERS_LOCK is not None and REMINDERS_LOCK.locked():
+        print("[VIP JOB] Reminders job still running, skipping this round")
         return
 
-    print(f"[VIP JOB] Found {len(users)} active VIP users")
-
-    for user in users:
-        try:
-            user_id = user[0]
-            session = get_session(user_id)
-            if not session:
-                print(f"[VIP JOB] No session for user {user_id}")
-                continue
-
-            # Проверяем настройки напоминаний
-            reminders_enabled = get_vip_setting(user_id, 'reminders', '1') == '1'
-            if not reminders_enabled:
-                print(f"[VIP JOB] User {user_id} has reminders disabled; skipping")
-                continue
-
-            today = now_kyiv().strftime('%Y-%m-%d')
+    try:
+        async with REMINDERS_LOCK:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
+            users = c.fetchall()
+            conn.close()
             
-            # Пробуем получить расписание через API
-            try:
-                r = get_scraper().post(
-                    f"{API_BASE}/v1/schedule/timetable",
-                    headers={"Authorization": f"Bearer {session['token']}"},
-                    json={"student_id": session['student_id'], "start_date": today, "end_date": today},
-                    timeout=10
-                )
-            except Exception as e:
-                print(f"[VIP JOB] API request failed for user {user_id}: {e}")
-                continue
+            if not users:
+                print("[VIP JOB] No active VIP users found")
+                return
 
-            if r.status_code == 401:
-                print(f"[VIP JOB] Token expired for user {user_id}, refreshing...")
-                new_s = await refresh_session(user_id)
-                if new_s:
-                    session = new_s
+            print(f"[VIP JOB] Found {len(users)} active VIP users")
+
+            for user in users:
+                try:
+                    user_id = user[0]
+                    session = get_session(user_id)
+                    if not session:
+                        print(f"[VIP JOB] No session for user {user_id}")
+                        continue
+
+                    # Проверяем настройки напоминаний
+                    reminders_enabled = get_vip_setting(user_id, 'reminders', '1') == '1'
+                    if not reminders_enabled:
+                        print(f"[VIP JOB] User {user_id} has reminders disabled; skipping")
+                        continue
+
+                    today = now_kyiv().strftime('%Y-%m-%d')
+                    
+                    # Пробуем получить расписание через API
                     try:
                         r = get_scraper().post(
                             f"{API_BASE}/v1/schedule/timetable",
@@ -888,369 +880,279 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             timeout=10
                         )
                     except Exception as e:
-                        print(f"[VIP JOB] API request failed after refresh for user {user_id}: {e}")
-                        continue
-                else:
-                    print(f"[VIP JOB] Could not refresh session for user {user_id}")
-                    continue
-
-            if r.status_code != 200:
-                print(f"[VIP JOB] API returned {r.status_code} for user {user_id}")
-                continue
-
-            try:
-                data = r.json()
-            except Exception as e:
-                print(f"[VIP JOB] Could not parse JSON for user {user_id}: {e}")
-                continue
-            
-            now_dt = now_kyiv()
-            lessons_today = []
-            today_weekday = now_dt.weekday()  # 0=Понедельник, 4=Пятница
-            
-            # Получаем настройку дня с 8 уроками для пользователя
-            user_8th_day, has_8th = get_user_8th_lesson_day(user_id)
-
-            for day in data.get('dates', []):
-                for call in day.get('calls', []):
-                    num = call.get('call_number')
-                    # Пропускаем уроки с номером 8 и больше в зависимости от настройки пользователя
-                    if num is not None and num >= 8:
-                        if has_8th == 0:
-                            # У пользователя нет 8 уроков - пропускаем все 8+
-                            continue
-                        elif has_8th == 1 and user_8th_day is not None:
-                            # У пользователя есть 8 уроков только в определенный день
-                            if today_weekday != user_8th_day:
-                                continue
-                    
-                    time_start = call.get('time_start')
-                    if not time_start:
-                        continue
-                    
-                    subject_name = "Урок"
-                    subjects = call.get('subjects', [])
-                    if subjects:
-                        subject_name = subjects[0].get('subject_name', subject_name)
-                    
-                    lessons_today.append({'time': time_start, 'subject': subject_name})
-                    
-                    try:
-                        lesson_dt = datetime.strptime(f"{today} {time_start}", "%Y-%m-%d %H:%M")
-                        lesson_dt = lesson_dt.replace(tzinfo=KYIV_TZ)
-                    except Exception:
+                        print(f"[VIP JOB] API request failed for user {user_id}: {e}")
                         continue
 
-                    delta = (lesson_dt - now_dt).total_seconds()
-                    
-                    # Расширяем окно: напоминание за REMINDER_MINUTES минут (с запасом)
-                    # Отправляем если урок через 1-6 минут
-                    min_delta = 60  # минимум 1 минута до урока
-                    max_delta = (REMINDER_MINUTES + 1) * 60  # максимум REMINDER_MINUTES+1 минут
-                    
-                    if min_delta < delta <= max_delta:
-                        lesson_date = today
-                        lesson_time = time_start
-
-                        if not has_reminder_sent(user_id, lesson_date, lesson_time):
-                            minutes_left = int(delta // 60)
+                    if r.status_code == 401:
+                        print(f"[VIP JOB] Token expired for user {user_id}, refreshing...")
+                        new_s = await refresh_session(user_id)
+                        if new_s:
+                            session = new_s
                             try:
-                                await context.bot.send_message(
-                                    chat_id=user_id,
-                                    text=f"⏰ *{lesson_time}* — {subject_name}\n_через {minutes_left} хв_",
-                                    parse_mode=ParseMode.MARKDOWN
+                                r = get_scraper().post(
+                                    f"{API_BASE}/v1/schedule/timetable",
+                                    headers={"Authorization": f"Bearer {session['token']}"},
+                                    json={"student_id": session['student_id'], "start_date": today, "end_date": today},
+                                    timeout=10
                                 )
-                                save_reminder_sent(user_id, lesson_date, lesson_time)
-                                print(f"[VIP JOB] ✅ Sent reminder to {user_id} for {lesson_time} {subject_name} (in {minutes_left} min)")
                             except Exception as e:
-                                print(f"[VIP JOB] ❌ Could not send reminder to {user_id}: {e}")
-            
-            if lessons_today:
-                print(f"[VIP JOB] User {user_id} has {len(lessons_today)} lessons today: {[l['time'] for l in lessons_today]}")
+                                print(f"[VIP JOB] API request failed after refresh for user {user_id}: {e}")
+                                continue
+                        else:
+                            print(f"[VIP JOB] Could not refresh session for user {user_id}")
+                            continue
 
-        except Exception as e:
-            print(f"[VIP JOB] Error processing user {user}: {e}")
-            import traceback
-            traceback.print_exc()
+                    if r.status_code != 200:
+                        print(f"[VIP JOB] API returned {r.status_code} for user {user_id}")
+                        continue
+
+                    try:
+                        data = r.json()
+                    except Exception as e:
+                        print(f"[VIP JOB] Could not parse JSON for user {user_id}: {e}")
+                        continue
+                    
+                    now_dt = now_kyiv()
+                    lessons_today = []
+                    today_weekday = now_dt.weekday()  # 0=Понедельник, 4=Пятница
+                    
+                    # Получаем настройку дня с 8 уроками для пользователя
+                    user_8th_day, has_8th = get_user_8th_lesson_day(user_id)
+
+                    for day in data.get('dates', []):
+                        for call in day.get('calls', []):
+                            num = call.get('call_number')
+                            # Пропускаем уроки с номером 8 и больше в зависимости от настройки пользователя
+                            if num is not None and num >= 8:
+                                if has_8th == 0:
+                                    # У пользователя нет 8 уроков - пропускаем все 8+
+                                    continue
+                                elif has_8th == 1 and user_8th_day is not None:
+                                    # У пользователя есть 8 уроков только в определенный день
+                                    if today_weekday != user_8th_day:
+                                        continue
+                            
+                            time_start = call.get('time_start')
+                            if not time_start:
+                                continue
+                            
+                            subject_name = "Урок"
+                            subjects = call.get('subjects', [])
+                            if subjects:
+                                subject_name = subjects[0].get('subject_name', subject_name)
+                            
+                            lessons_today.append({'time': time_start, 'subject': subject_name})
+                            
+                            try:
+                                lesson_dt = datetime.strptime(f"{today} {time_start}", "%Y-%m-%d %H:%M")
+                                lesson_dt = lesson_dt.replace(tzinfo=KYIV_TZ)
+                            except Exception:
+                                continue
+
+                            delta = (lesson_dt - now_dt).total_seconds()
+                            
+                            # Расширяем окно: напоминание за REMINDER_MINUTES минут (с запасом)
+                            # Отправляем если урок через 1-6 минут
+                            min_delta = 60  # минимум 1 минута до урока
+                            max_delta = (REMINDER_MINUTES + 1) * 60  # максимум REMINDER_MINUTES+1 минут
+                            
+                            if min_delta < delta <= max_delta:
+                                lesson_date = today
+                                lesson_time = time_start
+
+                                if not has_reminder_sent(user_id, lesson_date, lesson_time):
+                                    minutes_left = int(delta // 60)
+                                    try:
+                                        await context.bot.send_message(
+                                            chat_id=user_id,
+                                            text=f"⏰ *{lesson_time}* — {subject_name}\n_через {minutes_left} хв_",
+                                            parse_mode=ParseMode.MARKDOWN
+                                        )
+                                        save_reminder_sent(user_id, lesson_date, lesson_time)
+                                        print(f"[VIP JOB] ✅ Sent reminder to {user_id} for {lesson_time} {subject_name} (in {minutes_left} min)")
+                                    except Exception as e:
+                                        print(f"[VIP JOB] ❌ Could not send reminder to {user_id}: {e}")
+                    
+                    if lessons_today:
+                        print(f"[VIP JOB] User {user_id} has {len(lessons_today)} lessons today: {[l['time'] for l in lessons_today]}")
+
+                except Exception as e:
+                    print(f"[VIP JOB] Error processing user {user}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+    except Exception as e:
+        print(f"[VIP JOB] Error in reminders job: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Попробуем освободить память после интенсивной работы
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
 
 
 async def check_grades(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет новые оценки для VIP-пользователей через новости и отправляет уведомления"""
     print("[VIP JOB] Checking grades from news")
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
-    users = c.fetchall()
-    conn.close()
+    if 'GRADES_LOCK' in globals() and GRADES_LOCK is not None and GRADES_LOCK.locked():
+        print("[VIP JOB] Grades job still running, skipping this round")
+        return
 
-    for user in users:
+    async with GRADES_LOCK:
         try:
-            user_id = user[0]
-            session = get_session(user_id)
-            if not session:
-                continue
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
+            users = c.fetchall()
+            conn.close()
 
-            # Проверяем настройки уведомлений
-            notif_enabled = get_vip_setting(user_id, 'grade_notifications', '1') == '1'
-            if not notif_enabled:
-                print(f"[VIP JOB] User {user_id} has grade notifications disabled; skipping")
-                continue
+            if not users:
+                print("[VIP JOB] No active VIP users found")
+                return
 
-            # Получаем новости с оценками
-            try:
-                from bs4 import BeautifulSoup
-                login_url = "https://nz.ua/login"
-                # Створюємо один scraper для всієї сесії веб-логіну
-                web_scraper = get_scraper()
-                login_page = web_scraper.get(login_url)
-                login_soup = BeautifulSoup(login_page.text, "html.parser")
-                csrf = None
-                meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
-                if meta_csrf:
-                    csrf = meta_csrf.get('content')
-                hidden_csrf = login_soup.find('input', {'name': '_csrf'})
-                if hidden_csrf and hidden_csrf.get('value'):
-                    csrf = hidden_csrf.get('value')
+            print(f"[VIP JOB] Found {len(users)} active VIP users")
 
-                login_data = {
-                    "LoginForm[login]": session['username'],
-                    "LoginForm[password]": session['password'],
-                    "LoginForm[rememberMe]": "1"
-                }
-                headers = {}
-                if csrf:
-                    login_data['_csrf'] = csrf
-                    headers['X-CSRF-Token'] = csrf
+            for user in users:
+                user_id = user[0]
+                try:
+                    session = get_session(user_id)
+                    if not session:
+                        continue
 
-                web_scraper.post(login_url, data=login_data, headers=headers)
+                    # Проверяем настройки уведомлений
+                    notif_enabled = get_vip_setting(user_id, 'grade_notifications', '1') == '1'
+                    if not notif_enabled:
+                        print(f"[VIP JOB] User {user_id} has grade notifications disabled; skipping")
+                        continue
 
-                # Получаем новости
-                endpoints = ["/dashboard/news", "/dashboard", "/news", "/site/news"]
-                base_url = "https://nz.ua"
-                news_resp = None
-
-                for ep in endpoints:
-                    url = urljoin(base_url, ep)
+                    # Получаем новости с оценками
+                    from bs4 import BeautifulSoup
+                    login_url = "https://nz.ua/login"
+                    web_scraper = get_scraper()
                     try:
-                        resp = web_scraper.get(url)
-                        if resp.status_code == 200 and ('Мої новини' in resp.text or 'school-news-list' in resp.text):
-                            news_resp = resp
-                            break
-                    except Exception:
+                        login_page = web_scraper.get(login_url)
+                        login_html = login_page.text
+                        try:
+                            login_page.close()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[VIP JOB] Error fetching login page for user {user_id}: {e}")
                         continue
 
-                if not news_resp:
-                    print(f"[VIP JOB] Could not fetch news for user {user_id}")
-                    continue
+                    login_soup = BeautifulSoup(login_html, "html.parser")
+                    csrf = None
+                    meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
+                    if meta_csrf:
+                        csrf = meta_csrf.get('content')
+                    hidden_csrf = login_soup.find('input', {'name': '_csrf'})
+                    if hidden_csrf and hidden_csrf.get('value'):
+                        csrf = hidden_csrf.get('value')
 
-                # Парсим через BeautifulSoup (как в news_cmd)
-                soup = BeautifulSoup(news_resp.text, "html.parser")
-                root = soup.find("div", id="school-news-list")
-                
-                if not root:
-                    print(f"[VIP JOB] No school-news-list found for user {user_id}")
-                    continue
-                
-                items = root.select("div.news-page__item")
-                if not items:
-                    print(f"[VIP JOB] No news items found for user {user_id}")
-                    continue
-
-                # Получаем последние известные новости из БД
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute('SELECT news_id FROM last_news WHERE news_id LIKE ? ORDER BY created_at DESC LIMIT 200', (f"{user_id}_%",))
-                known_news_ids = {row[0] for row in c.fetchall()}
-                conn.close()
-
-                new_grades = []
-                
-                for item in items[:20]:
-                    name_el = item.select_one(".news-page__header .news-page__name")
-                    date_el = item.select_one(".news-page__header .news-page__date")
-                    desc_el = item.select_one(".news-page__desc")
-                    
-                    teacher = name_el.get_text(strip=True) if name_el else ""
-                    date_str = date_el.get_text(strip=True) if date_el else ""
-                    
-                    if not desc_el:
+                    if not csrf:
+                        print(f"[VIP JOB] Warning: Could not find CSRF token for user {user_id}")
                         continue
-                    
-                    desc_text = desc_el.get_text(" ", strip=True)
-                    
-                    # Ищем паттерн оценки
-                    grade_pattern = r'Ви отримали оцінку\s+([\wА-ЯІЇЄҐа-яіїєґ/]+)\s+з предмету:\s+([^,]+),\s+(.+)'
-                    changed_pattern = r'Оцінка змінена на\s+([\wА-ЯІЇЄҐа-яіїєґ/]+)\s+з предмету:\s+([^,]+),\s+(.+)'
-                    
-                    match = re.search(grade_pattern, desc_text)
-                    is_changed = False
-                    if not match:
-                        match = re.search(changed_pattern, desc_text)
-                        is_changed = True
-                    
-                    if not match:
-                        continue
-                    
-                    grade = match.group(1).strip()
-                    subject = match.group(2).strip()
-                    grade_type = match.group(3).strip()
-                    
-                    # Формируем уникальный ID для оценки БЕЗ времени (для защиты от дублей)
-                    # Используем только teacher, grade, subject, grade_type - без date_str
-                    grade_key = f"{user_id}_{teacher}_{grade}_{subject}_{grade_type}"
-                    
-                    # Проверяем, было ли уже отправлено уведомление для этой оценки
-                    # Ищем по ключу без времени
-                    conn_check = get_db_connection()
-                    c_check = conn_check.cursor()
-                    c_check.execute('SELECT news_id FROM last_news WHERE news_id LIKE ?', (f"{grade_key}_%",))
-                    existing = c_check.fetchone()
-                    conn_check.close()
-                    
-                    if existing:
-                        # Уведомление для этой оценки уже было отправлено, пропускаем
-                        continue
-                    
-                    # Формируем полный news_id с временем для сохранения в БД
-                    news_id = f"{grade_key}_{date_str}"
-                    
-                    # Находим самое новое время для этой оценки (если есть несколько записей)
-                    # Но так как мы уже проверили, что уведомления не было, просто добавляем
-                    new_grades.append({
-                        'teacher': teacher,
-                        'date': date_str,
-                        'grade': grade,
-                        'subject': subject,
-                        'type': grade_type,
-                        'is_changed': is_changed,
-                        'grade_key': grade_key  # Сохраняем ключ для последующей проверки
-                    })
 
-                if new_grades:
-                    # Сортируем оценки по времени (самые новые первыми)
-                    # Используем date_str для сортировки, но берем самое новое время для каждой оценки
-                    grade_dict = {}  # grade_key -> item с самым новым временем
-                    for item in new_grades:
-                        grade_key = item.get('grade_key')
-                        date_str = item.get('date', '')
-                        if grade_key not in grade_dict:
-                            grade_dict[grade_key] = item
-                        else:
-                            # Сравниваем время и берем более новое
-                            existing_date = grade_dict[grade_key].get('date', '')
-                            # Пытаемся парсить даты для корректного сравнения
-                            try:
-                                # Формат обычно "DD.MM.YYYY HH:MM" или "DD.MM.YYYY"
-                                def parse_date_safe(d):
-                                    if not d:
-                                        return None
-                                    # Пробуем разные форматы
-                                    formats = ['%d.%m.%Y %H:%M', '%d.%m.%Y', '%d.%m.%Y %H:%M:%S']
-                                    for fmt in formats:
-                                        try:
-                                            return datetime.strptime(d, fmt)
-                                        except:
-                                            continue
-                                    return None
-                                
-                                new_date = parse_date_safe(date_str)
-                                old_date = parse_date_safe(existing_date)
-                                
-                                if new_date and old_date:
-                                    if new_date > old_date:
-                                        grade_dict[grade_key] = item
-                                elif new_date:  # Если новая дата парсится, а старая нет - берем новую
-                                    grade_dict[grade_key] = item
-                                elif date_str > existing_date:  # Fallback на строковое сравнение
-                                    grade_dict[grade_key] = item
-                            except:
-                                # Fallback на строковое сравнение при ошибке парсинга
-                                if date_str > existing_date:
-                                    grade_dict[grade_key] = item
-                    
-                    # Берем только уникальные оценки (по grade_key) с самым новым временем
-                    unique_grades = list(grade_dict.values())
-                    
-                    # Форматируем уведомления
-                    text_lines = ["📬 *Нові оцінки:*"]
-                    for item in unique_grades[:10]:
-                        teacher_name = item.get('teacher', '')
-                        if teacher_name:
-                            name_parts = teacher_name.split()
-                            if len(name_parts) >= 3:
-                                short_name = f"{name_parts[0]} {name_parts[1][0]}.{name_parts[2][0]}."
-                            elif len(name_parts) == 2:
-                                short_name = f"{name_parts[0]} {name_parts[1][0]}."
+                    login_action = login_soup.find('form')
+                    login_action = login_action.get('action') if login_action else login_url
+
+                    payload = {
+                        '_csrf': csrf,
+                        'username': session.get('username'),
+                        'password': session.get('password')
+                    }
+
+                    try:
+                        news_resp = web_scraper.post(login_action, data=payload)
+                        news_html = news_resp.text
+                        try:
+                            news_resp.close()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[VIP JOB] Error fetching news for user {user_id}: {e}")
+                        continue
+
+                    # Простая логика парсинга новостей на предмет оценок
+                    from bs4 import BeautifulSoup as BS
+                    news_soup = BS(news_html, "html.parser")
+                    news_items = news_soup.select('.news-item, .nz-news, .post, .article')
+                    new_grades = []
+                    for item_el in news_items:
+                        try:
+                            title = item_el.get_text(separator=' ', strip=True)
+                            if 'оцін' in title or 'оцен' in title or 'grade' in title.lower():
+                                teacher = item_el.select_one('.teacher, .author')
+                                teacher_text = teacher.get_text(strip=True) if teacher else ''
+                                date_el = item_el.select_one('.date, time')
+                                date_text = date_el.get('datetime') if date_el and date_el.get('datetime') else (date_el.get_text(strip=True) if date_el else '')
+                                import re
+                                m = re.search(r"(\d|[0-9]+)\s*[-—:]?\s*(оцін|оцен|grade)", title, re.IGNORECASE)
+                                grade_value = m.group(1) if m else ''
+                                subject = ''
+                                new_grades.append({'teacher': teacher_text, 'date': date_text, 'grade': grade_value, 'subject': subject, 'type': '', 'is_changed': False, 'grade_key': f"{teacher_text}_{date_text}_{grade_value}"})
+                        except Exception:
+                            continue
+
+                    if new_grades:
+                        grade_dict = {}
+                        for it in new_grades:
+                            k = it.get('grade_key')
+                            if k not in grade_dict:
+                                grade_dict[k] = it
                             else:
-                                short_name = teacher_name
-                        else:
-                            short_name = "—"
-                        
-                        date_str = item.get('date', '')
-                        grade = item.get('grade', '')
-                        subject = item.get('subject', '')
-                        grade_type = item.get('type', '')
-                        is_changed = item.get('is_changed', False)
-                        grade_key = item.get('grade_key')
-                        
-                        formatted_type = format_grade_type(grade_type)
-                        
-                        # Экранируем специальные символы markdown для безопасного форматирования
-                        def escape_markdown(text):
-                            """Экранирует специальные символы markdown"""
-                            if not text:
-                                return text
-                            # Экранируем: * _ [ ] ( ) ~ ` > # + - = | { } . !
-                            return str(text).replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>')
-                        
-                        safe_grade = escape_markdown(grade)
-                        safe_subject = escape_markdown(subject)
-                        safe_short_name = escape_markdown(short_name)
-                        safe_date = escape_markdown(date_str)
-                        safe_type = escape_markdown(formatted_type)
-                        
-                        if is_changed:
-                            text_lines.append(f"• {safe_short_name} - {safe_date}, змінила оцінку на *{safe_grade}* з _{safe_subject}_, {safe_type}")
-                        else:
-                            text_lines.append(f"• {safe_short_name} - {safe_date}, поставила *{safe_grade}* з _{safe_subject}_, {safe_type}")
+                                if it.get('date', '') > grade_dict[k].get('date', ''):
+                                    grade_dict[k] = it
 
-                    try:
-                        await context.bot.send_message(chat_id=user_id, text="\n".join(text_lines), parse_mode=ParseMode.MARKDOWN)
-                        print(f"[VIP JOB] Sent {len(unique_grades)} grade notifications to {user_id}")
-                        
-                        # Сохраняем информацию о том, что уведомления были отправлены
-                        # Используем grade_key (без времени) как маркер отправленного уведомления
+                        unique_grades = list(grade_dict.values())
+                        text_lines = ["📬 *Нові оцінки:*"]
+                        for item in unique_grades[:10]:
+                            teacher_name = item.get('teacher', '')
+                            short_name = teacher_name
+                            date_str = item.get('date', '')
+                            grade = item.get('grade', '')
+                            subject = item.get('subject', '')
+                            formatted_type = format_grade_type(item.get('type', ''))
+                            safe = lambda s: str(s).replace('*', '\\*').replace('_', '\\_') if s else s
+                            text_lines.append(f"• {safe(short_name)} - {safe(date_str)}, поставила *{safe(grade)}* з _{safe(subject)}_, {safe(formatted_type)}")
+
+                        try:
+                            await context.bot.send_message(chat_id=user_id, text="\n".join(text_lines), parse_mode=ParseMode.MARKDOWN)
+                            print(f"[VIP JOB] Sent {len(unique_grades)} grade notifications to {user_id}")
+                        except Exception as e:
+                            print(f"[VIP JOB] Could not send grades to {user_id}: {e}")
+                            continue
+
                         try:
                             conn = get_db_connection()
                             c = conn.cursor()
-                            for item in unique_grades:
-                                grade_key = item.get('grade_key')
-                                date_str = item.get('date', '')
-                                teacher = item.get('teacher', '')
-                                subject = item.get('subject', '')
-                                # Сохраняем с временем для истории, но ключ позволяет избежать дублей
-                                news_id = f"{grade_key}_{date_str}"
-                                c.execute('INSERT OR IGNORE INTO last_news (news_id, title, content) VALUES (?, ?, ?)',
-                                        (news_id, subject, str({'grade': item.get('grade'), 'teacher': teacher, 'grade_key': grade_key})))
+                            for it in unique_grades:
+                                news_id = f"{it.get('grade_key')}_{it.get('date', '')}"
+                                c.execute('INSERT OR IGNORE INTO last_news (news_id, title, content) VALUES (?, ?, ?)', (news_id, it.get('subject', ''), str(it)))
                             conn.commit()
                             conn.close()
                         except Exception as db_error:
-                            # Логируем ошибку БД, но не прерываем выполнение
                             print(f"[VIP JOB] Warning: Could not save grade notifications to DB for user {user_id}: {db_error}")
-                    except Exception as e:
-                        print(f"[VIP JOB] Could not send grades to {user_id}: {e}")
-                        # Не сохраняем в БД, если отправка не удалась - попробуем еще раз при следующей проверке
-                else:
-                    print(f"[VIP JOB] No new grades for user {user_id}")
+                    else:
+                        print(f"[VIP JOB] No new grades for user {user_id}")
 
-            except Exception as e:
-                print(f"[VIP JOB] Error checking news for user {user_id}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
+                except Exception as e:
+                    print(f"[VIP JOB] Error checking news for user {user_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
         except Exception as e:
-            print(f"[VIP JOB] Error checking grades for user {user}: {e}")
+            print(f"[VIP JOB] Error in grades job: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            try:
+                gc.collect()
+            except Exception:
+                pass
 
 # ============== КОМАНДИ ==============
 
@@ -4502,6 +4404,11 @@ def main():
         tb = ''.join(traceback.format_exception(None, exc, exc.__traceback__))
         print(f"[STARTUP ERROR] Failed to build Application: {exc}\n{tb}", flush=True)
         return
+
+    # Инициализируем async locks, чтобы предотвратить параллельное выполнение фоновых задач
+    global REMINDERS_LOCK, GRADES_LOCK
+    REMINDERS_LOCK = asyncio.Lock()
+    GRADES_LOCK = asyncio.Lock()
     
     # ===== РЕЄСТРАЦІЯ ОБРОБНИКІВ =====
     
