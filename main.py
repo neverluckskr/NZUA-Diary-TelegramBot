@@ -1305,6 +1305,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Ви можете видалити дані командою /logout\n"
         "• Детальніше: /policy\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Дані використовуються *ЛИШЕ* для отримання інформації з NZ.UA *та не зберігаються у відкритому вигляді*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📱 *Для входу введіть свій логін NZ.UA:*"
     )
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
