@@ -4590,16 +4590,32 @@ def main():
         if WEBHOOK_URL_ENV:
             print(f"[STARTUP] Starting webhook mode on port {PORT}, webhook={WEBHOOK_URL_ENV}")
             url_path = f"bot{BOT_TOKEN}"
-            try:
-                # set webhook (best-effort)
-                app.bot.set_webhook(WEBHOOK_URL_ENV.rstrip('/') + '/' + url_path)
-            except Exception as e:
-                print(f"[STARTUP] set_webhook failed (continuing): {e}")
+            # Let run_webhook handle webhook setup; do NOT call app.bot.set_webhook() here (it's async and run_webhook will set the webhook).
             # run webhook server (blocks)
             app.run_webhook(listen="0.0.0.0", port=PORT, url_path=url_path, webhook_url=WEBHOOK_URL_ENV.rstrip('/') + '/' + url_path, drop_pending_updates=True)
         else:
             print("[STARTUP] Starting polling...")
             app.run_polling(drop_pending_updates=True)
+    except RuntimeError as exc:
+        # Common case: missing webhook extras (aiohttp) -> fallback to polling to avoid crash loop
+        msg = str(exc)
+        print(f"[STARTUP ERROR] RuntimeError during startup: {msg}")
+        if 'webhooks' in msg or 'start_webhook' in msg or 'aiohttp' in msg:
+            print("[STARTUP] Webhook support missing in the environment. Falling back to polling.\n" \
+                  "Please add `python-telegram-bot[webhooks]` to your requirements and redeploy to enable webhook mode.")
+            try:
+                print("[STARTUP] Starting polling (fallback)...")
+                app.run_polling(drop_pending_updates=True)
+            except Exception as exc2:
+                import traceback
+                tb2 = ''.join(traceback.format_exception(None, exc2, exc2.__traceback__))
+                print(f"[STARTUP ERROR] fallback polling failed: {exc2}\n{tb2}")
+                raise
+        else:
+            import traceback
+            tb = ''.join(traceback.format_exception(None, exc, exc.__traceback__))
+            print(f"[STARTUP ERROR] failed to start bot: {exc}\n{tb}")
+            raise
     except Exception as exc:
         import traceback
         tb = ''.join(traceback.format_exception(None, exc, exc.__traceback__))
