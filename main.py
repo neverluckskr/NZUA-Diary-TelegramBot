@@ -16,6 +16,9 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 def now_kyiv() -> datetime:
     """Возвращает текущее время в Europe/Kyiv"""
     return datetime.now(KYIV_TZ)
+
+# Utilities for safer scraping & memory checks
+from contextlib import contextmanager
 import json
 import re
 import base64
@@ -26,7 +29,13 @@ import time
 import threading
 import asyncio
 import gc
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Optional, lightweight memory metrics (if available)
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 from report_card_parser import parse_report_card
 
 try:
@@ -38,9 +47,17 @@ except Exception:
 
 API_BASE = "https://api-mobile.nz.ua"
 
+@contextmanager
 def get_scraper():
-    """Створює новий екземпляр scraper для ізоляції cookies між користувачами"""
-    return cloudscraper.create_scraper()
+    """Create a short-lived cloudscraper session; use as: with get_scraper() as s: r = s.post(...); r.close()"""
+    s = cloudscraper.create_scraper()
+    try:
+        yield s
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 # База даних
 # На Railway volume монтується на /data, локально використовуємо data/
@@ -148,6 +165,44 @@ GRADE_POLL_INTERVAL = int(os.getenv("GRADE_POLL_INTERVAL", "600"))  # прове
 GRADES_LOOKBACK_DAYS = int(os.getenv("GRADES_LOOKBACK_DAYS", "30"))  # сколько дней смотреть на оценки
 PING_URL = os.getenv("PING_URL")
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", "600"))  # каждые N секунд слать пинг, по умолчанию 10 минут
+
+# Memory-safe broadcast parameters
+BROADCAST_BATCH_SIZE = int(os.getenv('BROADCAST_BATCH_SIZE', '50'))
+BROADCAST_BATCH_PAUSE = float(os.getenv('BROADCAST_BATCH_PAUSE', '0.4'))  # seconds between batches
+SCRAPER_TIMEOUT = float(os.getenv('SCRAPER_TIMEOUT', '10'))
+
+
+def get_rss_mb():
+    """Return RSS in MB (psutil if available, else /proc fallback)."""
+    try:
+        if psutil:
+            return psutil.Process(os.getpid()).memory_info().rss / 1024**2
+        # Linux fallback
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+
+def log_memory(prefix=''):
+    try:
+        mb = get_rss_mb()
+        print(f"[MEM] {prefix} RSS={mb:.1f}MB")
+    except Exception:
+        pass
+
+
+def iterate_user_ids_batch(cursor, batch_size=100):
+    """Yield user ids from a cursor using fetchmany to avoid building large lists in memory."""
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        for r in rows:
+            yield r[0]
 
 # ============== БАЗА ДАНИХ ==============
 
@@ -846,17 +901,40 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             conn = get_db_connection()
             c = conn.cursor()
             c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
-            users = c.fetchall()
-            conn.close()
-            
-            if not users:
+            # stream users in batches to avoid loading all rows into memory
+            def iter_fetchmany(cursor, batch_size=200):
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for r in rows:
+                        yield r
+
+            users_gen = iter_fetchmany(c, batch_size=200)
+            # peek first user to detect empty resultset
+            try:
+                first_user = next(users_gen)
+            except StopIteration:
+                conn.close()
                 print("[VIP JOB] No active VIP users found")
                 return
 
-            print(f"[VIP JOB] Found {len(users)} active VIP users")
+            # chain first_user back to generator
+            def users_chain(first, gen):
+                yield first
+                yield from gen
+
+            users = users_chain(first_user, users_gen)
+            print("[VIP JOB] Streaming VIP users")
+            user_counter = 0
 
             for user in users:
                 try:
+                    user_counter += 1
+                    if (user_counter % 200) == 0:
+                        gc.collect()
+                        log_memory(f"reminders processed={user_counter}")
+                        await asyncio.sleep(0)
                     user_id = user[0]
                     session = get_session(user_id)
                     if not session:
@@ -873,12 +951,13 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     
                     # Пробуем получить расписание через API
                     try:
-                        r = get_scraper().post(
-                            f"{API_BASE}/v1/schedule/timetable",
-                            headers={"Authorization": f"Bearer {session['token']}"},
-                            json={"student_id": session['student_id'], "start_date": today, "end_date": today},
-                            timeout=10
-                        )
+                        with get_scraper() as s:
+                            r = s.post(
+                                f"{API_BASE}/v1/schedule/timetable",
+                                headers={"Authorization": f"Bearer {session['token']}"},
+                                json={"student_id": session['student_id'], "start_date": today, "end_date": today},
+                                timeout=SCRAPER_TIMEOUT
+                            )
                     except Exception as e:
                         print(f"[VIP JOB] API request failed for user {user_id}: {e}")
                         continue
@@ -889,12 +968,13 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                         if new_s:
                             session = new_s
                             try:
-                                r = get_scraper().post(
-                                    f"{API_BASE}/v1/schedule/timetable",
-                                    headers={"Authorization": f"Bearer {session['token']}"},
-                                    json={"student_id": session['student_id'], "start_date": today, "end_date": today},
-                                    timeout=10
-                                )
+                                with get_scraper() as s:
+                                    r = s.post(
+                                        f"{API_BASE}/v1/schedule/timetable",
+                                        headers={"Authorization": f"Bearer {session['token']}"},
+                                        json={"student_id": session['student_id'], "start_date": today, "end_date": today},
+                                        timeout=SCRAPER_TIMEOUT
+                                    )
                             except Exception as e:
                                 print(f"[VIP JOB] API request failed after refresh for user {user_id}: {e}")
                                 continue
@@ -910,7 +990,16 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                         data = r.json()
                     except Exception as e:
                         print(f"[VIP JOB] Could not parse JSON for user {user_id}: {e}")
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
                         continue
+                    finally:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
                     
                     now_dt = now_kyiv()
                     lessons_today = []
@@ -981,6 +1070,12 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     import traceback
                     traceback.print_exc()
 
+            # Close DB connection used for streaming
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     except Exception as e:
         print(f"[VIP JOB] Error in reminders job: {e}")
         import traceback
@@ -1006,16 +1101,37 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
             conn = get_db_connection()
             c = conn.cursor()
             c.execute('SELECT user_id, expires_at FROM vip_users WHERE expires_at > ?', (now_kyiv().isoformat(),))
-            users = c.fetchall()
-            conn.close()
+            # stream users to avoid loading all rows
+            def iter_fetchmany(cursor, batch_size=200):
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for r in rows:
+                        yield r
 
-            if not users:
+            users_gen = iter_fetchmany(c, batch_size=200)
+            try:
+                first_user = next(users_gen)
+            except StopIteration:
+                conn.close()
                 print("[VIP JOB] No active VIP users found")
                 return
 
-            print(f"[VIP JOB] Found {len(users)} active VIP users")
+            def users_chain(first, gen):
+                yield first
+                yield from gen
+
+            users = users_chain(first_user, users_gen)
+            print("[VIP JOB] Streaming VIP users")
+            user_counter = 0
 
             for user in users:
+                user_counter += 1
+                if (user_counter % 200) == 0:
+                    gc.collect()
+                    log_memory(f"grades processed={user_counter}")
+                    await asyncio.sleep(0)
                 user_id = user[0]
                 try:
                     session = get_session(user_id)
@@ -1028,52 +1144,49 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                         print(f"[VIP JOB] User {user_id} has grade notifications disabled; skipping")
                         continue
 
-                    # Получаем новости с оценками
+                    # Получаем новости с оценками (use short-lived scraper)
                     from bs4 import BeautifulSoup
                     login_url = "https://nz.ua/login"
-                    web_scraper = get_scraper()
+                    payload = None
                     try:
-                        login_page = web_scraper.get(login_url)
-                        login_html = login_page.text
-                        try:
-                            login_page.close()
-                        except Exception:
-                            pass
+                        with get_scraper() as web_scraper:
+                            # GET login page
+                            login_page = web_scraper.get(login_url, timeout=SCRAPER_TIMEOUT)
+                            login_html = login_page.text
+                            try:
+                                login_page.close()
+                            except Exception:
+                                pass
+
+                            login_soup = BeautifulSoup(login_html, "html.parser")
+                            csrf = None
+                            meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
+                            if meta_csrf:
+                                csrf = meta_csrf.get('content')
+                            hidden_csrf = login_soup.find('input', {'name': '_csrf'})
+                            if hidden_csrf and hidden_csrf.get('value'):
+                                csrf = hidden_csrf.get('value')
+
+                            if not csrf:
+                                raise ValueError('No CSRF token')
+
+                            login_action = login_soup.find('form')
+                            login_action = login_action.get('action') if login_action else login_url
+
+                            payload = {
+                                '_csrf': csrf,
+                                'username': session.get('username'),
+                                'password': session.get('password')
+                            }
+
+                            news_resp = web_scraper.post(login_action, data=payload, timeout=SCRAPER_TIMEOUT)
+                            news_html = news_resp.text
+                            try:
+                                news_resp.close()
+                            except Exception:
+                                pass
                     except Exception as e:
-                        print(f"[VIP JOB] Error fetching login page for user {user_id}: {e}")
-                        continue
-
-                    login_soup = BeautifulSoup(login_html, "html.parser")
-                    csrf = None
-                    meta_csrf = login_soup.find('meta', attrs={'name': 'csrf-token'})
-                    if meta_csrf:
-                        csrf = meta_csrf.get('content')
-                    hidden_csrf = login_soup.find('input', {'name': '_csrf'})
-                    if hidden_csrf and hidden_csrf.get('value'):
-                        csrf = hidden_csrf.get('value')
-
-                    if not csrf:
-                        print(f"[VIP JOB] Warning: Could not find CSRF token for user {user_id}")
-                        continue
-
-                    login_action = login_soup.find('form')
-                    login_action = login_action.get('action') if login_action else login_url
-
-                    payload = {
-                        '_csrf': csrf,
-                        'username': session.get('username'),
-                        'password': session.get('password')
-                    }
-
-                    try:
-                        news_resp = web_scraper.post(login_action, data=payload)
-                        news_html = news_resp.text
-                        try:
-                            news_resp.close()
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f"[VIP JOB] Error fetching news for user {user_id}: {e}")
+                        print(f"[VIP JOB] Error fetching/parsing news for user {user_id}: {e}")
                         continue
 
                     # Простая логика парсинга новостей на предмет оценок
@@ -1144,6 +1257,13 @@ async def check_grades(context: ContextTypes.DEFAULT_TYPE):
                     import traceback
                     traceback.print_exc()
                     continue
+
+            # Close DB connection used for streaming
+            try:
+                conn.close()
+            except Exception:
+                pass
+
         except Exception as e:
             print(f"[VIP JOB] Error in grades job: {e}")
             import traceback
@@ -1253,46 +1373,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text('❌ Тільки адміни можуть виконувати цю дію')
             context.user_data.pop('step', None)
             return
-        
+
         broadcast_text = update.message.text
-        
-        # Получаем всех пользователей из базы данных
+
         conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT DISTINCT user_id FROM sessions')
-        user_rows = c.fetchall()
-        conn.close()
-        
-        total_users = len(user_rows)
+
         success_count = 0
         failed_count = 0
-        
-        # Отправляем сообщение всем пользователям
-        await update.message.reply_text(f"📤 Розсилка повідомлення {total_users} користувачам...")
-        
-        for row in user_rows:
-            user_id = row[0]
-            try:
-                await context.bot.send_message(user_id, broadcast_text)
-                success_count += 1
-            except Exception as e:
-                failed_count += 1
-                print(f"[BROADCAST] Failed to send to user {user_id}: {e}")
-        
-        # Логируем действие админа
-        log_admin_action(update.effective_user.id, 'broadcast', details=f'sent to {success_count}/{total_users} users')
-        
-        # Отправляем отчет админу
+        await update.message.reply_text("📤 Розсилка повідомлення (батчами)…")
+
+        while True:
+            rows = c.fetchmany(BROADCAST_BATCH_SIZE)
+            if not rows:
+                break
+            for row in rows:
+                uid = row[0]
+                try:
+                    await context.bot.send_message(uid, broadcast_text)
+                    success_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    print(f"[BROADCAST] Failed to send to user {uid}: {e}")
+            del rows
+            gc.collect()
+            await asyncio.sleep(BROADCAST_BATCH_PAUSE)
+
+        conn.close()
+        # Log action and report
+        log_admin_action(update.effective_user.id, 'broadcast', details=f'sent to {success_count} users')
         result_text = (
             f"✅ *Розсилка завершена*\n\n"
             f"📊 Статистика:\n"
             f"• Успішно: {success_count}\n"
             f"• Не вдалось: {failed_count}\n"
-            f"• Всього: {total_users}"
         )
         await update.message.reply_text(result_text, parse_mode=ParseMode.MARKDOWN)
-        
         context.user_data.pop('step', None)
+        gc.collect()
+        log_memory('admin_broadcast')
         return
 
     # Обробка логіну
@@ -4355,17 +4475,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 # ============== ЗАПУСК ==============
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Простий HTTP handler для health check"""
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'OK')
-    
-    def log_message(self, format, *args):
-        # Отключаем логирование HTTP запросов
-        pass
+# Health HTTP handler removed — prefer webhook mode and lightweight memory usage.
 
 def run_bot(app):
     """Запускає бота в окремому потоці"""
@@ -4473,16 +4583,27 @@ def main():
         print("⚠️  Шифрування: ВИМКНЕНО (встановіть: pip install cryptography)")
     print("=" * 50)
 
-    # Start polling with error capture
+    # Start bot: prefer webhook on Railway (set WEBHOOK_URL env). Falls back to polling if not set.
+    WEBHOOK_URL_ENV = os.getenv('WEBHOOK_URL')
+    PORT = int(os.getenv('PORT', '8080'))
     try:
-        print("[STARTUP] Starting polling...")
-        # drop_pending_updates=True очищает очередь обновлений при старте
-        # Это помогает избежать конфликтов при перезапуске
-        app.run_polling(drop_pending_updates=True)
+        if WEBHOOK_URL_ENV:
+            print(f"[STARTUP] Starting webhook mode on port {PORT}, webhook={WEBHOOK_URL_ENV}")
+            url_path = f"bot{BOT_TOKEN}"
+            try:
+                # set webhook (best-effort)
+                app.bot.set_webhook(WEBHOOK_URL_ENV.rstrip('/') + '/' + url_path)
+            except Exception as e:
+                print(f"[STARTUP] set_webhook failed (continuing): {e}")
+            # run webhook server (blocks)
+            app.run_webhook(listen="0.0.0.0", port=PORT, url_path=url_path, webhook_url=WEBHOOK_URL_ENV.rstrip('/') + '/' + url_path, drop_pending_updates=True)
+        else:
+            print("[STARTUP] Starting polling...")
+            app.run_polling(drop_pending_updates=True)
     except Exception as exc:
         import traceback
         tb = ''.join(traceback.format_exception(None, exc, exc.__traceback__))
-        print(f"[STARTUP ERROR] app.run_polling failed: {exc}\n{tb}")
+        print(f"[STARTUP ERROR] failed to start bot: {exc}\n{tb}")
         raise
 
 # Global error handler to catch unhandled exceptions from handlers
